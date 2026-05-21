@@ -1,0 +1,57 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment overrides
+.env
+.env.local
+*.local
+
+# Model weights / large data (project-specific)
+*.pt
+*.pth
+*.onnx
+*.h5
+*.ckpt
+data/
+checkpoints/
