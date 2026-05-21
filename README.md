@@ -2,29 +2,28 @@
 
 Hand pose estimation project developed with Claude Code.
 
-## Overview
+> No runnable code exists in this revision yet. Setup and run instructions
+> below are placeholders and will be filled in as the project grows.
 
-This repository hosts work on hand pose detection and estimation. It is in its
-initial scaffolding phase — only project-tracking infrastructure exists so far.
+## Requirements
 
-## Repository Layout
+_To be added._
 
-- `README.md` — this file.
-- `CHANGELOG.md` — version history, beginning at `0001`.
-- `VERSION` — current released version identifier.
-- `.gitignore` — files excluded from version control.
+## Setup
 
-## Versioning
+```bash
+git clone git@github.com:optmly/hand_pose_claude.git
+cd hand_pose_claude
+```
 
-Releases are tagged using a zero-padded four-digit scheme (`0001`, `0002`, …).
-Every user-visible change is recorded in [CHANGELOG.md](CHANGELOG.md) before a
-new version is cut. The current version is stored in [VERSION](VERSION).
+_Environment setup steps (dependencies, virtualenv, etc.) will be added in a
+future revision._
 
-## Getting Started
+## Run
 
-The project does not yet contain runnable code. Future revisions will document
-environment setup, dependencies, and usage here.
+_Run commands will be added when the first executable component lands._
 
-## License
+## Version
 
-To be determined.
+The current release identifier is in [VERSION](VERSION). Full release history
+is in [CHANGELOG.md](CHANGELOG.md).
