@@ -8,7 +8,12 @@ The pipeline runs in two stages:
    per-video hand mask tracking. SAM 3 seeds at paired frames every 5 s,
    SAM 2 propagates the masks forward and backward, with identity preserved
    via Hungarian matching, wrist-based mask trimming, seed verification,
-   and a mask-collapse guard.
+   and a mask-collapse guard. After the pass finishes, a full-screen-collapse
+   detector (both obj_ids on the same blob, bbox + mask IoU >= 0.95) can
+   trigger an automatic retry with the alternate SAM 3 prompt
+   `"egocentric first person's hands"`. Finally a mask-spike filter
+   replaces short-run mask anomalies (centroid jump or >2x area change that
+   recovers within ~20 frames) with the previous frame's mask.
 2. **Pose** ([src/pose_video_mp.py](src/pose_video_mp.py)): MediaPipe
    HandLandmarker in VIDEO mode, with a hull-area size gate against the
    tracker masks, a 50%-expanded-square image-mode rerun for failures,

@@ -7,6 +7,33 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0005] - 2026-05-22
+
+### Tracker robustness
+- Full-screen collapse detection + fallback-prompt retry
+  (`detect_full_collapse`): after the tracking pipeline finishes, the tracker
+  scans every frame for cases where obj_0 and obj_1 have both bbox IoU and
+  mask IoU >= 0.95. If at least 3 frames trigger, the entire video is
+  re-tracked with the prompt `"egocentric first person's hands"` at lower SAM
+  3 thresholds (0.20 vs 0.50). The pass with fewer collapse frames is kept.
+  Replaces the rgb_33-style in-pass salvage with a cleaner end-to-end retry
+  (rgb_33).
+- Mask-spike filter (`filter_mask_spikes`): detects short-run (<= 20-frame)
+  mask anomalies and replaces them with the previous frame's mask. Spike
+  triggers on either centroid jump (> 10% of image diagonal) or area change
+  > 2x in either direction. Recovery checks only the dimension(s) that
+  triggered: area-only spikes (rgb_21 obj_0 f37-47, where the mask inflated
+  to the entire arm) do NOT require the centroid to return to the pre-spike
+  position, since the hand may have moved during the spike. Seed frames are
+  eligible for replacement, catching cases where SAM 3 re-seeded onto the
+  wrong location (rgb_09 f50 cross-screen jump).
+- Refactor: extracted `_run_tracking_pass(prompt, score_threshold,
+  mask_threshold)` from `track_one_video` so the same tracking sequence can be
+  invoked twice (primary + fallback). `resolve_mask_collapse` was moved out of
+  the per-pass body into the outer orchestrator so `detect_full_collapse` sees
+  the raw obj_0/obj_1 overlap (rather than the already-cleaned masks where
+  the smaller of the two was zeroed).
+
 ## [0004] - 2026-05-22
 
 ### Tracker robustness

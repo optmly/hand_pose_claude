@@ -49,8 +49,18 @@ SAM3_MODEL_ID = "facebook/sam3"
 SAM2_VIDEO_MODEL_ID = "facebook/sam2-hiera-base-plus"
 
 SAM3_PROMPT = "hand from above"
+# Fallback prompt used when post-pass detects that obj_0 and obj_1 collapsed
+# onto the same blob (one hand was lost). The whole video is re-tracked with
+# this prompt, which often picks up the actual hand pair more reliably in
+# scenes where "hand from above" anchored on a non-hand region first.
+FALLBACK_SAM3_PROMPT = "egocentric first person's hands"
 SAM3_SCORE_THRESHOLD = 0.50
 SAM3_MASK_THRESHOLD = 0.50
+# Fallback prompt is more specific and SAM 3 scores it noticeably lower; needs
+# its own relaxed thresholds or it returns 0 candidates. Empirical: rgb_33 at
+# every seed frame returns 0 at 0.50 but 1-2 verified hands at 0.20.
+FALLBACK_SAM3_SCORE_THRESHOLD = 0.20
+FALLBACK_SAM3_MASK_THRESHOLD = 0.20
 SAM3_NMS_IOU = 0.50  # SAM 3 occasionally emits overlapping duplicate masks for the same hand
 MAX_HAND_BBOX_AREA_FRAC = 0.20
 MAX_HANDS = 2  # wearer has at most two hands
@@ -86,6 +96,22 @@ WRIST_TRIM_MARGIN_FRAC = -0.06        # shift cut towards the forearm by |this| 
 # Seed verification: reject SAM 3 detections that don't look like hands
 SEED_VERIFY_MIN_SOLIDITY = 0.55       # mask_area / convex_hull_area (hands ~ 0.6-0.85)
 SEED_VERIFY_MAX_ASPECT = 3.5          # bbox long/short ratio (hands rarely > 3:1)
+
+# Full-collapse detection: after the tracking pipeline finishes, if obj_0 and
+# obj_1 end up on essentially the same blob (>= 95% IoU on BOTH bbox and mask)
+# for at least FULL_COLLAPSE_MIN_FRAMES frames, redo the entire video with
+# FALLBACK_SAM3_PROMPT. Replaces in-pass salvage for rgb_33-style failures.
+FULL_COLLAPSE_IOU = 0.95
+FULL_COLLAPSE_MIN_FRAMES = 3
+
+# Mask-spike filter: a short-run mask anomaly where the centroid jumps more
+# than ~10% of the image diagonal (or area inflates >2x) and recovers within
+# MAX_RUN frames is treated as a tracking spike. The spike frames are replaced
+# with the pre-spike mask. Targets rgb_09 (right-hand cross-screen jump ~1s)
+# and rgb_21 (left-hand inflated to entire arm ~1s).
+MASK_SPIKE_CENTROID_JUMP_FRAC = 0.10
+MASK_SPIKE_AREA_RATIO = 2.0
+MASK_SPIKE_MAX_RUN = 20
 
 
 def _iou(a, b):
@@ -328,6 +354,9 @@ def redetect_lost_tracks(
     reseed_frames: set[int],
     image_size: tuple[int, int],
     device: str,
+    prompt: str = SAM3_PROMPT,
+    score_threshold: float = SAM3_SCORE_THRESHOLD,
+    mask_threshold: float = SAM3_MASK_THRESHOLD,
 ) -> dict:
     """Detect lost-track runs, re-seed via SAM 3 at the run-start frame, and
     re-propagate SAM 2 from there. Returns a log dict for the JSON.
@@ -368,7 +397,10 @@ def redetect_lost_tracks(
         rgb = frame_rgb_at.get(f)
         if rgb is None:
             continue
-        boxes, scores, masks = run_sam3(sam3_proc, sam3_model, Image.fromarray(rgb), device)
+        boxes, scores, masks = run_sam3(
+            sam3_proc, sam3_model, Image.fromarray(rgb), device,
+            prompt=prompt, score_threshold=score_threshold, mask_threshold=mask_threshold,
+        )
         if len(boxes) == 0:
             log["redetections"].append({"frame": int(f), "obj_id": int(lost_oid), "outcome": "sam3_empty"})
             continue
@@ -505,6 +537,151 @@ def resolve_mask_collapse(
     return {"collapsed_runs": collapsed_runs, "frames_fixed": fixes}
 
 
+def _mask_centroid_area(mask: np.ndarray | None) -> tuple[tuple[float, float] | None, int]:
+    if mask is None or mask.sum() == 0:
+        return None, 0
+    ys, xs = np.where(mask)
+    return (float(xs.mean()), float(ys.mean())), int(len(xs))
+
+
+def detect_full_collapse(
+    masks_per_frame: dict[int, dict[int, np.ndarray]],
+    bbox_iou_thresh: float = FULL_COLLAPSE_IOU,
+    mask_iou_thresh: float = FULL_COLLAPSE_IOU,
+    min_frames: int = FULL_COLLAPSE_MIN_FRAMES,
+) -> dict:
+    """Detect frames where obj_0 and obj_1 collapsed onto the same blob.
+
+    Trigger: at least `min_frames` frames where both bbox IoU and mask IoU
+    are >= the respective thresholds. Such collapses indicate the other track
+    was lost entirely and cannot be recovered by in-pass fixes, so the caller
+    should re-track the whole video with a different SAM 3 prompt.
+    """
+    hit_frames: list[int] = []
+    for fidx in sorted(masks_per_frame.keys()):
+        per_obj = masks_per_frame[fidx]
+        if len(per_obj) < 2:
+            continue
+        oids = sorted(per_obj.keys())
+        m0, m1 = per_obj[oids[0]], per_obj[oids[1]]
+        if m0 is None or m1 is None or m0.sum() == 0 or m1.sum() == 0:
+            continue
+        inter = int((m0 & m1).sum())
+        union = int((m0 | m1).sum())
+        mask_iou = inter / union if union > 0 else 0.0
+        b0 = mask_bbox(m0)
+        b1 = mask_bbox(m1)
+        if b0 is None or b1 is None:
+            continue
+        bbox_iou = _iou(b0, b1)
+        if bbox_iou >= bbox_iou_thresh and mask_iou >= mask_iou_thresh:
+            hit_frames.append(int(fidx))
+    return {
+        "collapse_frames": hit_frames,
+        "n_collapse_frames": len(hit_frames),
+        "triggered": len(hit_frames) >= min_frames,
+        "bbox_iou_thresh": bbox_iou_thresh,
+        "mask_iou_thresh": mask_iou_thresh,
+        "min_frames": min_frames,
+    }
+
+
+def filter_mask_spikes(
+    masks_per_frame: dict[int, dict[int, np.ndarray]],
+    image_size: tuple[int, int],
+    reseed_frames: set[int],
+    centroid_jump_frac: float = MASK_SPIKE_CENTROID_JUMP_FRAC,
+    area_ratio: float = MASK_SPIKE_AREA_RATIO,
+    max_run: int = MASK_SPIKE_MAX_RUN,
+) -> dict:
+    """Detect short-run mask anomalies (centroid jump or area inflation that
+    recovers within `max_run` frames) and overwrite the anomalous frames with
+    the pre-spike mask.
+
+    For each obj_id: a spike is triggered at frame f if the centroid jumped
+    > centroid_jump_frac * diag from f-1, OR the area changed by more than
+    `area_ratio` from f-1 (inflated to > 2x f-1 OR shrunk to < f-1 / 2).
+    Recovery checks only the dimension(s) that triggered the spike — so an
+    area-only spike (mask inflates to entire arm and then back, rgb_21) does
+    NOT require the centroid to return to f-1's position; the hand may have
+    moved during the spike. The spike closes at the first frame f+k <= f+max_run
+    that satisfies the relevant recovery condition.
+
+    Reseed frames CAN be overwritten: a SAM 3 seed that lands far from where
+    SAM 2 was tracking is itself a spike (rgb_09 frame 50). The forward-lookup
+    still stops at the *next* reseed frame, since those represent independent
+    anchor points.
+    """
+    W, H = image_size
+    diag = float(np.hypot(W, H))
+    jump_thresh = centroid_jump_frac * diag
+    frames = sorted(masks_per_frame.keys())
+    log: dict = {"obj": {}, "total_replacements": 0}
+    for oid in (0, 1):
+        per_frame_ca = [
+            (f, *_mask_centroid_area(masks_per_frame[f].get(oid))) for f in frames
+        ]
+        replaced_runs: list[dict] = []
+        i = 1
+        while i < len(per_frame_ca):
+            f, c, a = per_frame_ca[i]
+            f_prev, c_prev, a_prev = per_frame_ca[i - 1]
+            if c is None or c_prev is None or a_prev <= 0:
+                i += 1
+                continue
+            jumped = float(np.hypot(c[0] - c_prev[0], c[1] - c_prev[1])) > jump_thresh
+            inflated = a > a_prev * area_ratio
+            shrunk = a_prev > a * area_ratio
+            if not (jumped or inflated or shrunk):
+                i += 1
+                continue
+            # If area changed, the centroid may NOT return (hand moved during
+            # the spike), so don't require centroid recovery in that case.
+            require_centroid_back = jumped and not (inflated or shrunk)
+            require_area_back = inflated or shrunk
+            recovered_at: int | None = None
+            for k in range(1, max_run + 1):
+                j = i + k
+                if j >= len(per_frame_ca):
+                    break
+                fj, cj, aj = per_frame_ca[j]
+                if fj in reseed_frames:
+                    break
+                if cj is None:
+                    continue
+                ok_c = (not require_centroid_back) or (
+                    float(np.hypot(cj[0] - c_prev[0], cj[1] - c_prev[1])) <= jump_thresh
+                )
+                ok_a = (not require_area_back) or (
+                    aj <= a_prev * area_ratio and a_prev <= aj * area_ratio
+                )
+                if ok_c and ok_a:
+                    recovered_at = j
+                    break
+            if recovered_at is None:
+                i += 1
+                continue
+            mask_prev = masks_per_frame[f_prev].get(oid)
+            if mask_prev is None or mask_prev.sum() == 0:
+                i += 1
+                continue
+            spike_frames: list[int] = []
+            for k in range(i, recovered_at):
+                fk = per_frame_ca[k][0]
+                masks_per_frame.setdefault(fk, {})[oid] = mask_prev.copy()
+                spike_frames.append(int(fk))
+                log["total_replacements"] += 1
+            if spike_frames:
+                replaced_runs.append({
+                    "start": spike_frames[0],
+                    "end": spike_frames[-1],
+                    "frames": spike_frames,
+                })
+            i = recovered_at + 1
+        log["obj"][str(oid)] = replaced_runs
+    return log
+
+
 def trim_mask_at_wrist(
     mask: np.ndarray, frame_rgb: np.ndarray, mp_image: mp_vision.HandLandmarker
 ) -> np.ndarray:
@@ -560,14 +737,19 @@ def trim_mask_at_wrist(
 
 
 @torch.no_grad()
-def run_sam3(processor, model, image: Image.Image, device: str):
+def run_sam3(
+    processor, model, image: Image.Image, device: str,
+    prompt: str = SAM3_PROMPT,
+    score_threshold: float = SAM3_SCORE_THRESHOLD,
+    mask_threshold: float = SAM3_MASK_THRESHOLD,
+):
     """Return (boxes_xyxy, scores, masks_bool_HW) for hands at this frame."""
-    inputs = processor(images=image, text=SAM3_PROMPT, return_tensors="pt").to(device)
+    inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
     outputs = model(**inputs)
     res = processor.post_process_instance_segmentation(
         outputs,
-        threshold=SAM3_SCORE_THRESHOLD,
-        mask_threshold=SAM3_MASK_THRESHOLD,
+        threshold=score_threshold,
+        mask_threshold=mask_threshold,
         target_sizes=inputs.get("original_sizes").tolist(),
     )[0]
     boxes_t = res["boxes"]
@@ -752,32 +934,29 @@ def pick_next_version_dir(base: Path) -> Path:
         n += 1
 
 
-def track_one_video(
+def _run_tracking_pass(
     video_path: Path,
-    out_video_path: Path,
-    out_meta_path: Path,
-    out_frames_path: Path,
-    sam3_proc,
-    sam3_model,
+    sam3_proc, sam3_model,
     sam2_video: SAM2VideoPredictor,
     mp_image: mp_vision.HandLandmarker,
-    device: str,
-    reseed_sec: float,
+    fps: float, num_frames: int, width: int, height: int,
+    device: str, reseed_sec: float,
+    prompt: str,
+    score_threshold: float = SAM3_SCORE_THRESHOLD,
+    mask_threshold: float = SAM3_MASK_THRESHOLD,
 ) -> dict:
+    """One full forward+backward+lost-track+collapse-resolve tracking pass
+    using `prompt` as the SAM 3 text prompt.
+
+    Returns a dict with masks_per_frame and all per-pass log structures. The
+    SAM 2 inference state is initialized and reset inside this call.
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"cannot open {video_path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    # PAIRED reseeds at (start, start+PAIR_OFFSET_FRAMES) every reseed_sec.
     pairs = reseed_pair_frames(num_frames, fps, reseed_sec, PAIR_OFFSET_FRAMES)
     flat_seeds = flatten_pairs(pairs)
 
-    # 1) Run SAM 3 at each seed frame; keep masks alongside boxes/scores.
-    # reseed_data[sidx] = [(obj_id, box, mask), ...]
     reseed_data: dict[int, list[tuple[int, np.ndarray, np.ndarray]]] = {}
     reseed_log: list[dict] = []
     last_box_per_obj: dict[int, np.ndarray] = {}
@@ -787,8 +966,10 @@ def track_one_video(
         frame_rgb = extract_frame(cap, sidx)
         if frame_rgb is None:
             continue
-        boxes, scores, masks = run_sam3(sam3_proc, sam3_model, Image.fromarray(frame_rgb), device)
-        # Verify each SAM 3 candidate looks like a hand (MP or shape).
+        boxes, scores, masks = run_sam3(
+            sam3_proc, sam3_model, Image.fromarray(frame_rgb), device,
+            prompt=prompt, score_threshold=score_threshold, mask_threshold=mask_threshold,
+        )
         if len(boxes) > 0:
             keep_idx = []
             for j in range(len(boxes)):
@@ -828,12 +1009,9 @@ def track_one_video(
                 "trimmed_mask_px": trimmed_area,
                 "trim_frac": (1.0 - trimmed_area / raw_area) if raw_area > 0 else 0.0,
             })
-            # Recompute bbox from the (possibly trimmed) mask so the bbox follows the cut
             if trimmed_area > 0:
                 ys, xs = np.where(trimmed)
-                new_bbox = np.array(
-                    [xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float32
-                )
+                new_bbox = np.array([xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float32)
             else:
                 new_bbox = boxes[j].astype(np.float32)
             entries.append((int(oid), new_bbox, trimmed))
@@ -852,17 +1030,18 @@ def track_one_video(
 
     if not reseed_data:
         return {
-            "video": video_path.name,
-            "fps": fps,
-            "num_frames": num_frames,
-            "size": [width, height],
-            "pairs": [[a, b] for a, b in pairs],
-            "reseeds": reseed_log,
             "status": "no_seeds",
-            "output_video": None,
+            "prompt": prompt,
+            "pairs": pairs,
+            "reseeds": reseed_log,
+            "masks_per_frame": {},
+            "reseed_data": reseed_data,
+            "backward_overrides": [],
+            "wrist_trim": wrist_trim_log,
+            "seed_verification": seed_verification_log,
+            "lost_track_redetection": {"checked": False, "lost_segments": [], "redetections": []},
         }
 
-    # 2) Initialize SAM 2 video state and add prompts at every seed frame.
     # All SAM 2 video ops must run under bfloat16 autocast; otherwise certain
     # videos trigger a "mat1 BFloat16 / mat2 Float" mismatch in memory_attention.
     backward_overrides_log: list[dict] = []
@@ -874,8 +1053,6 @@ def track_one_video(
         )
         for frame_idx, entries in reseed_data.items():
             for obj_id, _box, mask in entries:
-                # Feed the SAM 3 mask straight into SAM 2 so propagation starts
-                # anchored to the actual hand rather than re-segmenting a bbox.
                 sam2_video.add_new_mask(
                     inference_state=state,
                     frame_idx=frame_idx,
@@ -883,7 +1060,7 @@ def track_one_video(
                     mask=mask,
                 )
 
-        # 3) Forward propagate through the whole video.
+        # Forward propagate through the whole video.
         masks_per_frame: dict[int, dict[int, np.ndarray]] = {}
         for fidx, obj_ids, mask_logits in sam2_video.propagate_in_video(state):
             per_obj: dict[int, np.ndarray] = {}
@@ -894,33 +1071,24 @@ def track_one_video(
                 per_obj[int(oid)] = m.astype(bool)
             masks_per_frame[int(fidx)] = per_obj
 
-        # 4) Backward-propagate to cover gaps:
-        #    - between every pair of consecutive valid seeds (frames where SAM 3 detected
-        #      something), and
-        #    - from the FIRST valid seed all the way back to frame 0 if SAM 3 missed
-        #      the start of the video (e.g. rgb_06 had 0 detections at f=0 but 2 at f=50).
-        # Override the masks in those gap frames so SAM 2 starts the gap anchored at the
-        # later good seed rather than relying on forward propagation that may have
-        # nothing to track at the very beginning.
+        # Backward-propagate to cover gaps between consecutive valid seeds,
+        # including the leading gap (0 -> first valid seed).
         seed_frames = sorted(f for f in reseed_data.keys())
         backprop_pairs: list[tuple[int, int]] = []
         if seed_frames and seed_frames[0] > 0:
-            backprop_pairs.append((0, seed_frames[0]))  # leading gap
+            backprop_pairs.append((0, seed_frames[0]))
         for i in range(len(seed_frames) - 1):
             backprop_pairs.append((seed_frames[i], seed_frames[i + 1]))
         for a, b in backprop_pairs:
             n_track = b - a + 1
             n_overridden = 0
             for fidx, obj_ids, mask_logits in sam2_video.propagate_in_video(
-                state,
-                start_frame_idx=b,
-                max_frame_num_to_track=n_track,
-                reverse=True,
+                state, start_frame_idx=b, max_frame_num_to_track=n_track, reverse=True,
             ):
                 if fidx >= b or fidx < a:
                     continue
                 if fidx in reseed_data:
-                    continue  # don't override actual seed frames
+                    continue
                 per_obj: dict[int, np.ndarray] = {}
                 for oid, logit in zip(obj_ids, mask_logits):
                     m = (logit > 0).cpu().numpy()
@@ -929,29 +1097,133 @@ def track_one_video(
                     per_obj[int(oid)] = m.astype(bool)
                 masks_per_frame.setdefault(int(fidx), {}).update(per_obj)
                 n_overridden += 1
-            backward_overrides_log.append({
-                "pair": [a, b],
-                "frames_overridden": n_overridden,
-            })
+            backward_overrides_log.append({"pair": [a, b], "frames_overridden": n_overridden})
 
-    # 5) Lost-track redetection: scan every K frames; if MP can't anchor a hand
-    # inside an obj_id's mask, run SAM 3 on that frame and re-seed SAM 2 with
-    # the detection that doesn't match the OTHER obj_id. Catches drift onto
-    # non-hand objects between scheduled reseeds (rgb_33-style).
+    # Lost-track redetection runs SAM 3 outside autocast and SAM 2 inside.
     lost_track_report = redetect_lost_tracks(
         masks_per_frame, video_path, sam2_video, state,
         sam3_proc, sam3_model, mp_image,
         reseed_frames=set(reseed_data.keys()),
         image_size=(width, height),
         device=device,
+        prompt=prompt,
+        score_threshold=score_threshold,
+        mask_threshold=mask_threshold,
     )
 
-    # 6) Resolve mask collapses (both obj_ids stuck on the same hand).
+    sam2_video.reset_state(state)
+    del state
+
+    # NOTE: resolve_mask_collapse is intentionally NOT run here. It zeroes the
+    # smaller of two overlapping masks, which would hide a full-screen collapse
+    # from detect_full_collapse and prevent the fallback-prompt retry.
+    # track_one_video runs collapse resolution only on the CHOSEN pass.
+    return {
+        "status": "ok",
+        "prompt": prompt,
+        "pairs": pairs,
+        "reseeds": reseed_log,
+        "masks_per_frame": masks_per_frame,
+        "reseed_data": reseed_data,
+        "backward_overrides": backward_overrides_log,
+        "wrist_trim": wrist_trim_log,
+        "seed_verification": seed_verification_log,
+        "lost_track_redetection": lost_track_report,
+    }
+
+
+def track_one_video(
+    video_path: Path,
+    out_video_path: Path,
+    out_meta_path: Path,
+    out_frames_path: Path,
+    sam3_proc,
+    sam3_model,
+    sam2_video: SAM2VideoPredictor,
+    mp_image: mp_vision.HandLandmarker,
+    device: str,
+    reseed_sec: float,
+) -> dict:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"cannot open {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    # Pass 1: primary prompt
+    primary = _run_tracking_pass(
+        video_path, sam3_proc, sam3_model, sam2_video, mp_image,
+        fps, num_frames, width, height, device, reseed_sec,
+        prompt=SAM3_PROMPT,
+    )
+
+    # Detect full-screen collapse (both obj_ids on the same blob) and, if
+    # triggered, retry the whole video with FALLBACK_SAM3_PROMPT. Keep the
+    # pass with the fewer collapse frames.
+    if primary["status"] == "no_seeds":
+        primary_collapse = {"triggered": False, "n_collapse_frames": 0, "collapse_frames": []}
+    else:
+        primary_collapse = detect_full_collapse(primary["masks_per_frame"])
+    fallback: dict | None = None
+    fallback_collapse: dict | None = None
+    chosen = primary
+    used_pass = "primary"
+    if primary_collapse.get("triggered"):
+        fallback = _run_tracking_pass(
+            video_path, sam3_proc, sam3_model, sam2_video, mp_image,
+            fps, num_frames, width, height, device, reseed_sec,
+            prompt=FALLBACK_SAM3_PROMPT,
+            score_threshold=FALLBACK_SAM3_SCORE_THRESHOLD,
+            mask_threshold=FALLBACK_SAM3_MASK_THRESHOLD,
+        )
+        if fallback["status"] == "no_seeds":
+            fallback_collapse = {"triggered": False, "n_collapse_frames": 0, "collapse_frames": []}
+        else:
+            fallback_collapse = detect_full_collapse(fallback["masks_per_frame"])
+        if (fallback["status"] == "ok"
+                and fallback_collapse["n_collapse_frames"] < primary_collapse["n_collapse_frames"]):
+            chosen = fallback
+            used_pass = "fallback"
+
+    if chosen["status"] == "no_seeds":
+        return {
+            "video": video_path.name,
+            "fps": fps,
+            "num_frames": num_frames,
+            "size": [width, height],
+            "pairs": [[a, b] for a, b in chosen["pairs"]],
+            "reseeds": chosen["reseeds"],
+            "status": "no_seeds",
+            "output_video": None,
+            "sam3_prompt": chosen["prompt"],
+            "used_pass": used_pass,
+            "full_collapse_check": {
+                "primary": primary_collapse,
+                "fallback": fallback_collapse,
+            },
+        }
+
+    masks_per_frame = chosen["masks_per_frame"]
+    reseed_data = chosen["reseed_data"]
+
+    # Resolve in-pass mask collapses (smaller mask zeroed). Runs AFTER
+    # detect_full_collapse + fallback retry so that full collapses still get a
+    # chance to trigger the fallback path.
     collapse_report = resolve_mask_collapse(
         masks_per_frame, set(reseed_data.keys()), image_size=(width, height)
     )
 
-    # 4) Write output video with overlays + per-frame RLE masks JSON.
+    # Smooth short-run mask spikes (rgb_09 cross-screen jump etc).
+    spike_report = filter_mask_spikes(
+        masks_per_frame,
+        image_size=(width, height),
+        reseed_frames=set(reseed_data.keys()),
+    )
+
+    # Write output video with overlays + per-frame RLE masks JSON.
     cap = cv2.VideoCapture(str(video_path))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_video_path), fourcc, fps, (width, height))
@@ -990,10 +1262,6 @@ def track_one_video(
         "frames": frame_records,
     }))
 
-    # Free GPU memory before next video
-    sam2_video.reset_state(state)
-    del state
-
     meta = {
         "video": video_path.name,
         "fps": fps,
@@ -1001,13 +1269,20 @@ def track_one_video(
         "size": [width, height],
         "reseed_interval_sec": reseed_sec,
         "pair_offset_frames": PAIR_OFFSET_FRAMES,
-        "pairs": [[a, b] for a, b in pairs],
-        "reseeds": reseed_log,
-        "backward_overrides": backward_overrides_log,
-        "wrist_trim": wrist_trim_log,
-        "seed_verification": seed_verification_log,
-        "lost_track_redetection": lost_track_report,
+        "pairs": [[a, b] for a, b in chosen["pairs"]],
+        "sam3_prompt": chosen["prompt"],
+        "used_pass": used_pass,
+        "full_collapse_check": {
+            "primary": primary_collapse,
+            "fallback": fallback_collapse,
+        },
+        "reseeds": chosen["reseeds"],
+        "backward_overrides": chosen["backward_overrides"],
+        "wrist_trim": chosen["wrist_trim"],
+        "seed_verification": chosen["seed_verification"],
+        "lost_track_redetection": chosen["lost_track_redetection"],
         "mask_collapse_resolution": collapse_report,
+        "mask_spike_filter": spike_report,
         "tracked_frames": len(masks_per_frame),
         "output_video": str(out_video_path.name),
     }
