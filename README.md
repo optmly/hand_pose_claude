@@ -20,8 +20,11 @@ The pipeline runs in two stages:
    and a frame-to-frame consistency filter.
 
 A standalone post-process ([src/label_tracking_handedness.py](src/label_tracking_handedness.py))
-adds L/R wearer-anatomical labels to an existing tracking output by sampling
-frames and majority-voting MP handedness per obj_id.
+adds L/R wearer-anatomical labels to an existing tracking output. It samples
+frames and queries SAM 3 with the explicit prompts `"wearer left hand"` and
+`"wearer right hand"`; each top detection is matched to the nearest tracker
+obj_id by bbox-centroid distance, and the (Left, Right) pair maximizing the
+joint confidence sum is assigned.
 
 ## Requirements
 
@@ -68,9 +71,12 @@ python src/pose_video_mp.py --num 10 --track-dir outputs/track_v<N> --output-bas
 Each tracker run writes, per video:
 
 - `<stem>_track.mp4` -- overlay video (one mask + bbox per obj_id)
-- `<stem>_track.json` -- reseed log, pair structure, backward overrides,
-  wrist-trim stats, seed-verification log, mask-collapse resolution
+- `<stem>_track.json` -- which prompt + pass was used, full-collapse check,
+  reseed log, pair structure, backward overrides, wrist-trim stats,
+  seed-verification log, mask-collapse resolution, mask-spike filter log
 - `<stem>_track.frames.json` -- per-frame masks (COCO RLE) + bboxes per obj_id
+- `<stem>_track_labeled.mp4` -- post-label overlay video with L/R tags
+  (after `label_tracking_handedness.py`)
 
 Each pose run writes:
 

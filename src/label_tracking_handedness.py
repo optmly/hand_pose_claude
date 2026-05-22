@@ -1,22 +1,27 @@
-"""Annotate L/R hand labels onto tracking videos via MediaPipe HandLandmarker.
+"""Annotate L/R hand labels onto tracking videos using SAM 3 with explicit
+"wearer left/right hand" text prompts.
 
 For each video in a tracking-output dir (default outputs/track_v<N>/), this:
   1. Loads <stem>_track.frames.json (per-frame COCO-RLE masks per obj_id).
   2. Samples up to N_SAMPLE_FRAMES evenly across the video.
-  3. For each sampled frame, for each obj_id with a non-empty mask, crops the
-     RGB frame around the mask bbox expanded by MP_CROP_EXPAND, squared, and
-     runs MP HandLandmarker (IMAGE mode) on the crop.
-  4. Tallies MP handedness votes per obj_id; assigns 'left' / 'right' by
-     majority. obj_ids that get no MP signal are left unlabeled.
-  5. Re-renders the overlay video as <stem>_track_labeled.mp4 with:
-       - the existing mask fill + bbox (same colors as the tracker)
-       - convex hull of the mask's largest connected component
-       - 'L' or 'R' label at the centroid of each hand
+  3. At each sampled frame, runs SAM 3 with the prompts SAM3_LEFT_PROMPT and
+     SAM3_RIGHT_PROMPT. For each prompt, the top-scoring detection (above
+     SAM3_SCORE_THRESHOLD) is associated with the tracker's nearest obj_id by
+     bbox-centroid distance. Confidence scores are summed into a per-(obj_id,
+     L/R) cell.
+  4. Final assignment uses joint-max on the confidence sums: for the two-
+     obj_id case (the wearer's two hands are anatomically opposite), the
+     (Left, Right) assignment between obj_0 and obj_1 that maximizes the
+     joint confidence sum is picked.
+  5. Re-renders the overlay video as <stem>_track_labeled.mp4 with mask fill,
+     bbox, convex hull, and 'L'/'R' label at the centroid of each hand.
   6. Writes the handedness map back into <stem>_track.json
      (`wearer_handedness_by_obj_id`).
 
-This is a post-process to src/track_video_sam2.py; the tracker remains
-detector-only and this script adds anatomical labels via MP.
+Replaces an earlier MP HandLandmarker-based labeler. MP was unreliable on
+ego-centric views (frequently mirrored or unable to detect at all when the
+hand is gloved); SAM 3 with text prompts directly identifies the wearer's
+anatomical L/R regardless of where the hand appears on screen.
 """
 
 from __future__ import annotations
@@ -27,21 +32,20 @@ import time
 from pathlib import Path
 
 import cv2
-import mediapipe as mp
 import numpy as np
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
+import torch
+from PIL import Image
 from pycocotools import mask as coco_mask
+from transformers import Sam3Model, Sam3Processor
 
-# MediaPipe model paths in priority order
-MP_MODEL_PATHS = [
-    Path("/home/jingjin/.cache/mediapipe/hand_landmarker.task"),
-    Path(__file__).resolve().parents[1] / "models" / "hand_landmarker.task",
-]
-MP_HAND_DET_CONF = 0.20         # generous - the crop is already tight around a hand
-MP_CROP_EXPAND = 0.50           # bbox expansion before squaring/cropping for MP
-N_SAMPLE_FRAMES = 24            # how many frames to sample for handedness voting
-MIN_VOTES_TO_LABEL = 1          # require at least this many MP detections per obj
+SAM3_MODEL_ID = "facebook/sam3"
+SAM3_LEFT_PROMPT = "wearer left hand"
+SAM3_RIGHT_PROMPT = "wearer right hand"
+SAM3_SCORE_THRESHOLD = 0.30      # accept SAM 3 detections at >= this score
+SAM3_MASK_THRESHOLD = 0.30
+SAM3_MATCH_MAX_DIST_FRAC = 0.20  # SAM 3 detection -> obj_id match must be within this * diag
+N_SAMPLE_FRAMES = 24             # how many frames to sample for handedness voting
+MIN_VOTES_TO_LABEL = 1           # require at least this many votes per obj_id
 
 # Visualization
 MASK_COLORS_BGR = [(255, 80, 0), (0, 80, 255)]
@@ -50,23 +54,10 @@ LABEL_BG_COLOR = (0, 0, 0)
 LABEL_FG_COLOR = (0, 255, 255)
 
 
-def _find_mp_model() -> Path:
-    for p in MP_MODEL_PATHS:
-        if p.exists():
-            return p
-    raise FileNotFoundError("hand_landmarker.task not found in any known cache.")
-
-
-def load_mp_image() -> mp_vision.HandLandmarker:
-    base = mp_python.BaseOptions(model_asset_path=str(_find_mp_model()))
-    opts = mp_vision.HandLandmarkerOptions(
-        base_options=base,
-        running_mode=mp_vision.RunningMode.IMAGE,
-        num_hands=1,
-        min_hand_detection_confidence=MP_HAND_DET_CONF,
-        min_hand_presence_confidence=MP_HAND_DET_CONF,
-    )
-    return mp_vision.HandLandmarker.create_from_options(opts)
+def load_sam3(device: str):
+    proc = Sam3Processor.from_pretrained(SAM3_MODEL_ID)
+    model = Sam3Model.from_pretrained(SAM3_MODEL_ID, device_map=device).eval()
+    return proc, model
 
 
 def decode_mask_rle(rle: dict) -> np.ndarray:
@@ -74,33 +65,57 @@ def decode_mask_rle(rle: dict) -> np.ndarray:
     return coco_mask.decode(raw).astype(bool)
 
 
-def expand_to_square_crop(
-    bbox, image_w: int, image_h: int, expand_frac: float = MP_CROP_EXPAND
-) -> tuple[int, int, int, int]:
-    x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
-    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    side = max(x2 - x1, y2 - y1) * (1.0 + expand_frac)
-    half = side / 2.0
-    return (
-        max(0, int(round(cx - half))),
-        max(0, int(round(cy - half))),
-        min(image_w, int(round(cx + half))),
-        min(image_h, int(round(cy + half))),
-    )
+@torch.no_grad()
+def sam3_detect(processor, model, image: Image.Image, device: str, prompt: str):
+    """Return (top_box_xyxy, top_score) for the highest-confidence SAM 3 hit
+    above SAM3_SCORE_THRESHOLD, or None."""
+    inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
+    outputs = model(**inputs)
+    res = processor.post_process_instance_segmentation(
+        outputs,
+        threshold=SAM3_SCORE_THRESHOLD,
+        mask_threshold=SAM3_MASK_THRESHOLD,
+        target_sizes=inputs.get("original_sizes").tolist(),
+    )[0]
+    boxes_t = res["boxes"]
+    scores_t = res["scores"]
+    if len(boxes_t) == 0:
+        return None
+    boxes = boxes_t.cpu().numpy() if hasattr(boxes_t, "cpu") else np.asarray(boxes_t)
+    scores = scores_t.cpu().numpy() if hasattr(scores_t, "cpu") else np.asarray(scores_t)
+    top = int(np.argmax(scores))
+    return boxes[top], float(scores[top])
 
 
-def mp_handedness_on_crop(mp_image: mp_vision.HandLandmarker, frame_rgb: np.ndarray, bbox, W: int, H: int) -> str | None:
-    sx1, sy1, sx2, sy2 = expand_to_square_crop(bbox, W, H)
-    if sx2 <= sx1 or sy2 <= sy1:
+def match_to_obj_id(
+    detection_bbox: np.ndarray,
+    obj_bboxes: dict[int, list[float]],
+    image_diag: float,
+) -> int | None:
+    """Return the obj_id whose tracker bbox centroid is nearest to the SAM 3
+    detection bbox centroid, provided the distance is within
+    SAM3_MATCH_MAX_DIST_FRAC * image_diag. Returns None if no obj_id is close
+    enough."""
+    if not obj_bboxes:
         return None
-    crop = np.ascontiguousarray(frame_rgb[sy1:sy2, sx1:sx2])
-    if crop.size == 0:
+    dcx = (detection_bbox[0] + detection_bbox[2]) / 2.0
+    dcy = (detection_bbox[1] + detection_bbox[3]) / 2.0
+    best_oid = None
+    best_d = float("inf")
+    for oid, bb in obj_bboxes.items():
+        if bb is None:
+            continue
+        ocx = (bb[0] + bb[2]) / 2.0
+        ocy = (bb[1] + bb[3]) / 2.0
+        d = float(np.hypot(dcx - ocx, dcy - ocy))
+        if d < best_d:
+            best_d = d
+            best_oid = oid
+    if best_oid is None:
         return None
-    img = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop)
-    result = mp_image.detect(img)
-    if not result.handedness:
+    if best_d > SAM3_MATCH_MAX_DIST_FRAC * image_diag:
         return None
-    return result.handedness[0][0].category_name  # "Left" or "Right"
+    return best_oid
 
 
 def largest_cc_hull(mask: np.ndarray) -> np.ndarray | None:
@@ -128,19 +143,29 @@ def mask_centroid(mask: np.ndarray) -> tuple[int, int] | None:
 def determine_handedness(
     video_path: Path,
     frames_meta: dict,
-    mp_image: mp_vision.HandLandmarker,
+    sam3_proc, sam3_model,
+    device: str,
     n_samples: int = N_SAMPLE_FRAMES,
-) -> tuple[dict[int, str], dict[int, dict[str, int]]]:
-    """Sample frames, run MP on each obj_id's hand, return per-obj L/R + vote tallies."""
+) -> tuple[dict[int, str], dict[int, dict[str, float]], dict[int, dict[str, int]]]:
+    """Sample frames; at each, run SAM 3 with `SAM3_LEFT_PROMPT` and
+    `SAM3_RIGHT_PROMPT` and match each detection to the nearest tracker
+    obj_id by centroid distance. Returns the final L/R assignment plus
+    confidence-weighted vote sums and raw counts.
+
+    Final assignment uses joint-max on confidence sums for the two-obj_id
+    case (the wearer's two hands are anatomically opposite, so the (Left,
+    Right) pair must be different).
+    """
     frames = frames_meta["frames"]
     W, H = frames_meta["size"]
+    image_diag = float(np.hypot(W, H))
     n_frames = len(frames)
     if n_frames == 0:
-        return {}, {}
+        return {}, {}, {}
     sample_idxs = sorted(set(np.linspace(0, n_frames - 1, min(n_samples, n_frames)).round().astype(int).tolist()))
-    # Index the frames we need
     needed = set(sample_idxs)
-    votes: dict[int, dict[str, int]] = {}
+    score_sums: dict[int, dict[str, float]] = {}
+    counts: dict[int, dict[str, int]] = {}
 
     cap = cv2.VideoCapture(str(video_path))
     fidx = 0
@@ -150,37 +175,50 @@ def determine_handedness(
             break
         if fidx in needed:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb)
             frame_meta = frames[fidx]
+            obj_bboxes: dict[int, list[float]] = {}
             for h in frame_meta["hands"]:
                 if h.get("bbox") is None or h.get("mask_rle") is None:
                     continue
-                oid = int(h["obj_id"])
-                label = mp_handedness_on_crop(mp_image, rgb, h["bbox"], W, H)
-                if label in ("Left", "Right"):
-                    d = votes.setdefault(oid, {"Left": 0, "Right": 0})
-                    d[label] += 1
+                obj_bboxes[int(h["obj_id"])] = h["bbox"]
+            if obj_bboxes:
+                for prompt, label in ((SAM3_LEFT_PROMPT, "Left"), (SAM3_RIGHT_PROMPT, "Right")):
+                    det = sam3_detect(sam3_proc, sam3_model, img, device, prompt)
+                    if det is None:
+                        continue
+                    det_bbox, det_score = det
+                    matched_oid = match_to_obj_id(det_bbox, obj_bboxes, image_diag)
+                    if matched_oid is None:
+                        continue
+                    sd = score_sums.setdefault(matched_oid, {"Left": 0.0, "Right": 0.0})
+                    cd = counts.setdefault(matched_oid, {"Left": 0, "Right": 0})
+                    sd[label] += det_score
+                    cd[label] += 1
         fidx += 1
     cap.release()
 
     handedness: dict[int, str] = {}
-    ambiguous: list[int] = []
-    for oid, d in votes.items():
-        if d["Left"] + d["Right"] < MIN_VOTES_TO_LABEL:
-            continue
-        if d["Left"] > d["Right"]:
-            handedness[oid] = "left"
-        elif d["Right"] > d["Left"]:
-            handedness[oid] = "right"
+    eligible = [oid for oid, d in counts.items() if d["Left"] + d["Right"] >= MIN_VOTES_TO_LABEL]
+    if len(eligible) == 2:
+        a, b = sorted(eligible)
+        sa, sb = score_sums[a], score_sums[b]
+        score_AB = sa["Left"] + sb["Right"]
+        score_BA = sa["Right"] + sb["Left"]
+        if score_AB >= score_BA:
+            handedness[a] = "left"
+            handedness[b] = "right"
         else:
-            ambiguous.append(oid)
-    # Pairwise complement: if exactly one obj is unambiguously labeled and another
-    # is tied, assume the tied one is the opposite anatomical hand.
-    if ambiguous and len(handedness) == 1:
-        known_oid, known_label = next(iter(handedness.items()))
-        opposite = "right" if known_label == "left" else "left"
-        for oid in ambiguous:
-            handedness[oid] = opposite
-    return handedness, votes
+            handedness[a] = "right"
+            handedness[b] = "left"
+    else:
+        for oid in eligible:
+            d = score_sums[oid]
+            if d["Left"] > d["Right"]:
+                handedness[oid] = "left"
+            elif d["Right"] > d["Left"]:
+                handedness[oid] = "right"
+    return handedness, score_sums, counts
 
 
 def render_labeled_video(
@@ -237,7 +275,7 @@ def render_labeled_video(
     writer.release()
 
 
-def process_one(track_dir: Path, video_stem: str, source_dir: Path, mp_image: mp_vision.HandLandmarker) -> dict:
+def process_one(track_dir: Path, video_stem: str, source_dir: Path, sam3_proc, sam3_model, device: str) -> dict:
     video_path = source_dir / f"{video_stem}.mp4"
     frames_json = track_dir / f"{video_stem}_track.frames.json"
     meta_json = track_dir / f"{video_stem}_track.json"
@@ -248,20 +286,26 @@ def process_one(track_dir: Path, video_stem: str, source_dir: Path, mp_image: mp
         return {"video": video_stem, "error": "frames json missing"}
 
     frames_meta = json.loads(frames_json.read_text())
-    handedness, votes = determine_handedness(video_path, frames_meta, mp_image)
+    handedness, score_sums, counts = determine_handedness(
+        video_path, frames_meta, sam3_proc, sam3_model, device
+    )
     render_labeled_video(video_path, frames_meta, handedness, out_video)
 
     # Update meta json
     if meta_json.exists():
         meta = json.loads(meta_json.read_text())
         meta["wearer_handedness_by_obj_id"] = {str(k): v for k, v in handedness.items()}
-        meta["handedness_votes_by_obj_id"] = {str(k): v for k, v in votes.items()}
+        meta["handedness_votes_by_obj_id"] = {str(k): v for k, v in counts.items()}
+        meta["handedness_score_sums_by_obj_id"] = {
+            str(k): {kk: round(vv, 3) for kk, vv in v.items()} for k, v in score_sums.items()
+        }
         meta_json.write_text(json.dumps(meta, indent=2))
 
     return {
         "video": video_stem,
         "wearer_handedness_by_obj_id": {str(k): v for k, v in handedness.items()},
-        "votes": {str(k): v for k, v in votes.items()},
+        "votes": {str(k): v for k, v in counts.items()},
+        "score_sums": {str(k): {kk: round(vv, 3) for kk, vv in v.items()} for k, v in score_sums.items()},
         "labeled_video": out_video.name,
     }
 
@@ -271,6 +315,7 @@ def parse_args():
     ap.add_argument("--track-dir", default=None, help="Tracking dir; default: latest outputs/track_v<N>")
     ap.add_argument("--source-dir", default="data", help="Source mp4 dir")
     ap.add_argument("--videos", nargs="*", default=None, help="video stems (e.g. rgb_10); default: all in track-dir")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return ap.parse_args()
 
 
@@ -297,13 +342,15 @@ def main():
                        if not p.stem.endswith("_track_labeled"))
 
     print(f"Videos to label: {len(stems)}")
-    mp_image = load_mp_image()
+    print(f"Loading {SAM3_MODEL_ID} on {args.device} ...")
+    sam3_proc, sam3_model = load_sam3(args.device)
+    print("SAM 3 loaded.")
     summary = []
     t0 = time.time()
     for i, stem in enumerate(stems, 1):
         tic = time.time()
         try:
-            res = process_one(track_dir, stem, source_dir, mp_image)
+            res = process_one(track_dir, stem, source_dir, sam3_proc, sam3_model, args.device)
             summary.append(res)
             h = res.get("wearer_handedness_by_obj_id", {})
             print(f"  [{i}/{len(stems)}] {stem}: {h} ({time.time()-tic:.1f}s)")

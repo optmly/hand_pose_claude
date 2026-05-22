@@ -7,6 +7,27 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0006] - 2026-05-22
+
+### Labeler -- SAM 3 with "wearer left/right hand" prompts
+- `src/label_tracking_handedness.py` rewritten to use SAM 3 with explicit
+  text prompts `"wearer left hand"` and `"wearer right hand"` instead of
+  MediaPipe HandLandmarker. At each sampled frame, the top SAM 3 detection
+  for each prompt is matched to the nearest tracker obj_id by bbox-centroid
+  distance (within 20% of image diagonal). Confidence-weighted joint-max
+  assignment picks the (Left, Right) pair between obj_0 / obj_1 that
+  maximizes the total SAM 3 confidence sum.
+- Fixes prior MP-based labeler failures:
+  - rgb_10: MP voted majority-Right on both obj_ids, producing two right
+    hands. SAM 3 directly assigns the correct {0: left, 1: right}.
+  - rgb_14: MP returned no detections (black gloves -- no skin tones for
+    HandLandmarker). SAM 3 succeeds.
+  - rgb_38, rgb_47: MP's per-frame handedness output was noisy and the
+    wrong-direction votes summed higher; SAM 3's explicit L/R prompts
+    return consistent labels regardless of on-screen position (so a
+    wearer's left hand reaching to the right side of the screen is still
+    labeled left).
+
 ## [0005] - 2026-05-22
 
 ### Tracker robustness
