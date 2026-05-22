@@ -7,6 +7,27 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0004] - 2026-05-22
+
+### Tracker robustness
+- `mask_bbox` now returns the bounding box of the largest connected component
+  rather than the bbox of all mask pixels. Eliminates the random bbox jumps
+  caused by tiny stray pixels SAM 2 occasionally emits far from the main hand
+  blob (rgb_34).
+- Mid-stream lost-track redetection
+  (`find_lost_track_segments` + `redetect_lost_tracks`): after forward and
+  backward propagation, the tracker samples every 15 frames and runs MP on
+  each obj_id's mask region. When MP cannot place a wrist or palm-base
+  landmark inside the mask for at least 2 consecutive sampled frames, the
+  obj_id is marked lost. SAM 3 is run on the start-of-run frame; a SAM 3
+  candidate that does not overlap the *other* obj_id's mask is wrist-trimmed
+  and fed to SAM 2 via `add_new_mask`. SAM 2 is then re-propagated forward
+  from the earliest redetection. Recovers cases where SAM 2 drifted onto a
+  non-hand object between scheduled reseeds (rgb_33).
+- `redetect_lost_tracks` carefully splits SAM 3 calls (outside the bfloat16
+  autocast) from SAM 2 mask injection + re-propagation (inside autocast), so
+  SAM 3's bfloat16 tensor outputs don't hit `.cpu().numpy()` directly.
+
 ## [0003] - 2026-05-22
 
 ### Added

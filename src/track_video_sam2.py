@@ -66,6 +66,12 @@ MASK_COLLAPSE_IOU = 0.30                  # IoU >= this counts as overlapping
 MASK_COLLAPSE_CENTROID_PX_FRAC = 0.05     # OR centroid distance < this * image diagonal
 MASK_COLLAPSE_MIN_RUN = 3                 # require this many consecutive overlapping frames
 
+# Lost-track detection: scan every N frames; if MP can't anchor a hand landmark
+# inside the obj_id's mask, the mask is on a non-hand. Trigger SAM 3 re-detection
+# for that obj_id and re-seed SAM 2 with the matched detection.
+LOST_TRACK_CHECK_INTERVAL = 15            # check every K frames (~0.5s at 30fps)
+LOST_TRACK_MIN_LOST_RUN = 2               # require at least 2 consecutive failed checks
+
 # Wrist-trim (helps when SAM 3 segments long gloves / forearm along with the hand)
 MP_MODEL_PATHS = [
     Path("/home/jingjin/.cache/mediapipe/hand_landmarker.task"),
@@ -204,6 +210,220 @@ def seed_is_hand_like(
     if solidity >= SEED_VERIFY_MIN_SOLIDITY and aspect <= SEED_VERIFY_MAX_ASPECT:
         return True, f"shape ok (sol={solidity:.2f}, ar={aspect:.2f}){note}"
     return False, f"shape rejected (sol={solidity:.2f}, ar={aspect:.2f}){note}"
+
+
+def _mp_finds_hand_in_mask(
+    mp_image: mp_vision.HandLandmarker,
+    mask: np.ndarray,
+    frame_rgb: np.ndarray,
+) -> bool:
+    """Run MP on a crop around the mask; return True if MP's wrist or a palm-base
+    landmark falls inside the mask. Same anchoring rule as `seed_is_hand_like`.
+    """
+    if mask is None or mask.sum() == 0:
+        return False
+    H, W = mask.shape[:2]
+    bbox = mask_bbox(mask)
+    if bbox is None:
+        return False
+    sx1, sy1, sx2, sy2 = expand_to_square_crop_xyxy(bbox, W, H, WRIST_TRIM_CROP_EXPAND)
+    if sx2 <= sx1 or sy2 <= sy1:
+        return False
+    crop = np.ascontiguousarray(frame_rgb[sy1:sy2, sx1:sx2])
+    if crop.size == 0:
+        return False
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop)
+    result = mp_image.detect(mp_img)
+    if not result.hand_landmarks:
+        return False
+    lms = result.hand_landmarks[0]
+    cw, ch = sx2 - sx1, sy2 - sy1
+    for li in (0, 5, 9, 13, 17):  # wrist + palm-base knuckles
+        px = int(round(lms[li].x * cw + sx1))
+        py = int(round(lms[li].y * ch + sy1))
+        if 0 <= px < W and 0 <= py < H and bool(mask[py, px]):
+            return True
+    return False
+
+
+def find_lost_track_segments(
+    masks_per_frame: dict[int, dict[int, np.ndarray]],
+    video_path: Path,
+    mp_image: mp_vision.HandLandmarker,
+    reseed_frames: set[int],
+) -> dict[int, list[tuple[int, int]]]:
+    """Return {obj_id: [(start_lost_frame, ...), ...]} for tracks that no longer have a hand.
+
+    Sampled every LOST_TRACK_CHECK_INTERVAL frames. A "lost" run is at least
+    LOST_TRACK_MIN_LOST_RUN consecutive failed checks. The start of the run
+    is what we'll use as the SAM 3 re-detection frame.
+    """
+    sample_frames = sorted(
+        f for f in masks_per_frame.keys()
+        if f % LOST_TRACK_CHECK_INTERVAL == 0
+    )
+    if not sample_frames:
+        return {}
+    cap = cv2.VideoCapture(str(video_path))
+    needed = set(sample_frames)
+    frame_cache: dict[int, np.ndarray] = {}
+    fidx = 0
+    while True:
+        ok, bgr = cap.read()
+        if not ok:
+            break
+        if fidx in needed:
+            frame_cache[fidx] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        fidx += 1
+    cap.release()
+    lost_runs: dict[int, list[tuple[int, int]]] = {}
+    streak: dict[int, int | None] = {}
+    for f in sample_frames:
+        rgb = frame_cache.get(f)
+        if rgb is None:
+            continue
+        per_obj = masks_per_frame.get(f, {})
+        for oid in (0, 1):
+            mask = per_obj.get(oid)
+            if mask is None or mask.sum() == 0:
+                # Mask already empty (collapse guard or natural loss) — skip.
+                if streak.get(oid) is not None:
+                    streak[oid] = None
+                continue
+            if f in reseed_frames:
+                # Don't second-guess true reseed frames.
+                streak[oid] = None
+                continue
+            ok_hand = _mp_finds_hand_in_mask(mp_image, mask, rgb)
+            if not ok_hand:
+                s = streak.get(oid)
+                if s is None:
+                    streak[oid] = f  # start of a lost run
+            else:
+                if streak.get(oid) is not None:
+                    lost_runs.setdefault(oid, []).append((streak[oid], f))
+                    streak[oid] = None
+    # Close out runs still open at the end
+    for oid, s in streak.items():
+        if s is not None:
+            lost_runs.setdefault(oid, []).append((s, sample_frames[-1] + 1))
+    # Require minimum run length
+    out: dict[int, list[tuple[int, int]]] = {}
+    for oid, runs in lost_runs.items():
+        for start, end in runs:
+            # Number of sampled checks in [start, end)
+            n_checks = sum(1 for f in sample_frames if start <= f < end)
+            if n_checks >= LOST_TRACK_MIN_LOST_RUN:
+                out.setdefault(oid, []).append((start, end))
+    return out
+
+
+def redetect_lost_tracks(
+    masks_per_frame: dict[int, dict[int, np.ndarray]],
+    video_path: Path,
+    sam2_video: SAM2VideoPredictor,
+    state,
+    sam3_proc, sam3_model,
+    mp_image: mp_vision.HandLandmarker,
+    reseed_frames: set[int],
+    image_size: tuple[int, int],
+    device: str,
+) -> dict:
+    """Detect lost-track runs, re-seed via SAM 3 at the run-start frame, and
+    re-propagate SAM 2 from there. Returns a log dict for the JSON.
+
+    SAM 3 must run OUTSIDE the bfloat16 autocast (it returns BF16 tensors that
+    .cpu().numpy() can't materialize). SAM 2 ops (`add_new_mask`,
+    `propagate_in_video`) are wrapped in autocast separately.
+    """
+    W, H = image_size
+    log = {"checked": True, "lost_segments": [], "redetections": []}
+    lost_runs = find_lost_track_segments(masks_per_frame, video_path, mp_image, reseed_frames)
+    if not lost_runs:
+        return log
+    interventions: list[tuple[int, int]] = []
+    for oid, runs in lost_runs.items():
+        for start, end in runs:
+            interventions.append((start, oid))
+            log["lost_segments"].append({"obj_id": int(oid), "start": int(start), "end": int(end)})
+    interventions.sort()
+
+    # Pre-read each intervention frame
+    needed = sorted({s for s, _ in interventions})
+    frame_rgb_at: dict[int, np.ndarray] = {}
+    cap = cv2.VideoCapture(str(video_path))
+    fidx = 0
+    while True:
+        ok, bgr = cap.read()
+        if not ok:
+            break
+        if fidx in needed:
+            frame_rgb_at[fidx] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        fidx += 1
+    cap.release()
+
+    # Stage 1: SAM 3 re-detect (no autocast)
+    new_seeds: list[tuple[int, int, np.ndarray]] = []  # (frame, obj_id, trimmed_mask)
+    for f, lost_oid in interventions:
+        rgb = frame_rgb_at.get(f)
+        if rgb is None:
+            continue
+        boxes, scores, masks = run_sam3(sam3_proc, sam3_model, Image.fromarray(rgb), device)
+        if len(boxes) == 0:
+            log["redetections"].append({"frame": int(f), "obj_id": int(lost_oid), "outcome": "sam3_empty"})
+            continue
+        other_oid = 1 - lost_oid
+        other_mask = masks_per_frame.get(f, {}).get(other_oid)
+        best_j = None
+        best_score = -1.0
+        for j in range(len(boxes)):
+            cand = masks[j].astype(bool)
+            if other_mask is not None and other_mask.sum() > 0:
+                inter = int((cand & other_mask).sum())
+                cand_area = int(cand.sum())
+                if cand_area > 0 and inter / cand_area > 0.4:
+                    continue
+            if scores[j] > best_score:
+                best_score = float(scores[j])
+                best_j = j
+        if best_j is None:
+            log["redetections"].append({"frame": int(f), "obj_id": int(lost_oid), "outcome": "no_complement"})
+            continue
+        trimmed = trim_mask_at_wrist(masks[best_j].astype(bool), rgb, mp_image)
+        if trimmed.sum() == 0:
+            trimmed = masks[best_j].astype(bool)
+        new_seeds.append((int(f), int(lost_oid), trimmed))
+        log["redetections"].append({
+            "frame": int(f), "obj_id": int(lost_oid),
+            "outcome": "reseeded", "sam3_score": best_score,
+        })
+
+    if not new_seeds:
+        return log
+
+    # Stage 2: SAM 2 add_new_mask + re-propagate (wrap in autocast)
+    earliest_reseed = min(s[0] for s in new_seeds)
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for f, oid, mask in new_seeds:
+            sam2_video.add_new_mask(inference_state=state, frame_idx=f, obj_id=oid, mask=mask)
+            masks_per_frame.setdefault(f, {})[oid] = mask
+
+        n_overridden = 0
+        for fidx, obj_ids, mask_logits in sam2_video.propagate_in_video(
+            state, start_frame_idx=earliest_reseed
+        ):
+            if fidx in reseed_frames:
+                continue
+            per_obj = {}
+            for oid, logit in zip(obj_ids, mask_logits):
+                m = (logit > 0).cpu().numpy()
+                if m.ndim == 3:
+                    m = m[0]
+                per_obj[int(oid)] = m.astype(bool)
+            masks_per_frame[int(fidx)] = per_obj
+            n_overridden += 1
+    log["repropagated_frames"] = n_overridden
+    return log
 
 
 def resolve_mask_collapse(
@@ -483,10 +703,22 @@ def encode_mask_rle(mask: np.ndarray) -> dict:
 
 
 def mask_bbox(mask: np.ndarray) -> list[float] | None:
+    """Bounding box of the LARGEST connected component of `mask`.
+
+    Using the largest CC instead of all mask pixels prevents stray pixels far
+    from the main hand blob from inflating the bbox (rgb_34 had random bbox
+    jumps to ~2x size because SAM 2 occasionally emits tiny disconnected blobs).
+    """
     if mask.sum() == 0:
         return None
-    ys, xs = np.where(mask)
-    return [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+    m_u8 = mask.astype(np.uint8)
+    num, _, stats, _ = cv2.connectedComponentsWithStats(m_u8, connectivity=8)
+    if num <= 1:
+        ys, xs = np.where(mask)
+        return [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+    biggest = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
+    x, y, w, h, _ = stats[biggest]
+    return [float(x), float(y), float(x + w - 1), float(y + h - 1)]
 
 
 def overlay_masks(frame_bgr: np.ndarray, masks_by_obj: dict[int, np.ndarray]) -> np.ndarray:
@@ -702,7 +934,19 @@ def track_one_video(
                 "frames_overridden": n_overridden,
             })
 
-    # 5) Resolve mask collapses (both obj_ids stuck on the same hand).
+    # 5) Lost-track redetection: scan every K frames; if MP can't anchor a hand
+    # inside an obj_id's mask, run SAM 3 on that frame and re-seed SAM 2 with
+    # the detection that doesn't match the OTHER obj_id. Catches drift onto
+    # non-hand objects between scheduled reseeds (rgb_33-style).
+    lost_track_report = redetect_lost_tracks(
+        masks_per_frame, video_path, sam2_video, state,
+        sam3_proc, sam3_model, mp_image,
+        reseed_frames=set(reseed_data.keys()),
+        image_size=(width, height),
+        device=device,
+    )
+
+    # 6) Resolve mask collapses (both obj_ids stuck on the same hand).
     collapse_report = resolve_mask_collapse(
         masks_per_frame, set(reseed_data.keys()), image_size=(width, height)
     )
@@ -762,6 +1006,7 @@ def track_one_video(
         "backward_overrides": backward_overrides_log,
         "wrist_trim": wrist_trim_log,
         "seed_verification": seed_verification_log,
+        "lost_track_redetection": lost_track_report,
         "mask_collapse_resolution": collapse_report,
         "tracked_frames": len(masks_per_frame),
         "output_video": str(out_video_path.name),
