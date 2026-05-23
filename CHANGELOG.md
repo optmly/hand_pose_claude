@@ -7,6 +7,37 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0007] - 2026-05-23
+
+### Tracker -- handle longer / full-length videos
+- Added `--max-sec` CLI flag (default 60). Any input mp4 longer than the cap
+  is re-encoded via ffmpeg (`truncate_video_to_frames`) into a temp mp4 with
+  exactly `--max-sec * fps` frames before being handed to the tracking
+  pipeline. Used 30 s for the first pass on the full-length dataset at
+  `/mnt/data/ws/nv-data/full/`.
+- Adaptive SAM 2 memory handling for longer clips
+  (`OFFLOAD_VIDEO_FRAME_THRESHOLD=600`, `OFFLOAD_STATE_FRAME_THRESHOLD=2000`,
+  `JPEG_STREAMING_FRAME_THRESHOLD=1000`). Videos past the streaming threshold
+  are pre-decoded to a `<tmp>/sam2_<stem>_*` JPEG folder so `init_state` can
+  use `async_loading_frames=True`. The temp folder is cleaned up in a
+  `try/finally` around the pass.
+- `decode_video_to_jpegs` helper writes `00000.jpg` ... `<n>.jpg` (the naming
+  SAM 2's `init_state(video_path=<dir>)` expects).
+- Aggressive cleanup between videos: each `track_one_video` call is followed
+  by `gc.collect()` + `torch.cuda.empty_cache()` to release any lingering
+  `AsyncVideoFrameLoader` tensors, and truncated mp4s are deleted as soon as
+  tracking finishes. Without this the process accumulates host-RAM use across
+  videos and the kernel OOM-kills it around the 18th 60 s-cap video.
+- For very long videos (e.g., rgb_43 at 243 s), even with the above the
+  current SAM 2 frame-loader cache strategy still pushes host RAM past
+  comfort. Running the tracker as a per-video subprocess loop (one python
+  invocation per input mp4) plus a 30 s cap was the reliable way to clear
+  all 50 full-length videos.
+
+### Outputs
+- `outputs/track_v<N>/` now contains 50 / 50 tracked + L/R-labeled clips for
+  the full-length dataset (each truncated to 30 s).
+
 ## [0006] - 2026-05-22
 
 ### Labeler -- SAM 3 with "wearer left/right hand" prompts

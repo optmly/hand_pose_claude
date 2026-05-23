@@ -57,12 +57,28 @@ huggingface-cli login
 #    Auto-versions to outputs/track_v<N>/.
 python src/track_video_sam2.py
 
-# Optional: just a single video, reverse order, etc.
+# Optional flags:
+#   --videos data/rgb_01.mp4 data/rgb_18.mp4   # explicit list of inputs
+#   --reverse                                  # process in reverse order
+#   --max-sec 30                               # truncate each video to N seconds
+#                                              # before tracking (default 60).
+#                                              # Set this lower for long clips
+#                                              # to stay under SAM 2's frame-
+#                                              # loader RAM budget.
 python src/track_video_sam2.py --videos data/rgb_01.mp4 data/rgb_18.mp4
-python src/track_video_sam2.py --reverse
+python src/track_video_sam2.py --max-sec 30
 
-# 2) Label tracks with L / R wearer-anatomical labels (writes <stem>_track_labeled.mp4)
+# For very long full-length clips a per-video subprocess loop is more reliable
+# than a single python invocation, since SAM 2's frame loader does not evict
+# loaded frames across videos. Example pattern:
+for v in /mnt/data/ws/nv-data/full/rgb_*.mp4; do
+    python src/track_video_sam2.py --videos "$v" --max-sec 30 --output-base outputs
+done
+
+# 2) Label tracks with L / R wearer-anatomical labels (writes <stem>_track_labeled.mp4).
+#    Pass --source-dir if the source mp4s live somewhere other than data/.
 python src/label_tracking_handedness.py --track-dir outputs/track_v<N>
+python src/label_tracking_handedness.py --track-dir outputs/track_v<N> --source-dir /path/to/source
 
 # 3) Pose estimation on the first N videos using the tracker masks
 python src/pose_video_mp.py --num 10 --track-dir outputs/track_v<N> --output-base outputs

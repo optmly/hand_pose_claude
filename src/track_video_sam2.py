@@ -29,7 +29,11 @@ Outputs go to outputs/track_v<N>/ where <N> auto-increments.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -68,6 +72,28 @@ MAX_HANDS = 2  # wearer has at most two hands
 RESEED_INTERVAL_SEC = 5.0
 PAIR_OFFSET_FRAMES = 50          # second seed of each pair is this many frames after the first
 MASK_COLORS_BGR = [(255, 80, 0), (0, 80, 255)]  # obj 0 = blue-ish, obj 1 = red-ish (BGR)
+
+# SAM 2 video-predictor memory offload. Frames at 1920x1440 ~= 8 MB each on
+# the GPU; a 1300-frame clip would push >10 GB just for the video tensor.
+# These thresholds switch on CPU offload past comfortable budgets on a 24 GB
+# 4090, trading throughput for memory headroom.
+OFFLOAD_VIDEO_FRAME_THRESHOLD = 600
+OFFLOAD_STATE_FRAME_THRESHOLD = 2000
+
+# For longer videos we pre-decode the mp4 into a JPEG folder so SAM 2 can
+# stream frames (async_loading_frames=True). The mp4-path code path in SAM 2
+# loads all frames into one big tensor upfront, which OOMs anything over a
+# couple thousand frames on a 4090 even with offload_video_to_cpu=True.
+JPEG_STREAMING_FRAME_THRESHOLD = 1000
+
+# Even with JPEG streaming + offload, SAM 2's AsyncVideoFrameLoader caches
+# every loaded frame in CPU RAM and never evicts. At 1024x1024x3xfloat32
+# (~12 MB per frame post-resize), beyond ~2000 frames the host runs out of
+# RAM (~62 GB on this box) and the kernel OOM-kills the process. For long
+# videos we pre-truncate to MAX_TRACK_SEC seconds via ffmpeg before handing
+# the (now-shorter) mp4 to the tracker. Set this to None / very large to
+# disable truncation.
+MAX_TRACK_SEC_DEFAULT = 60.0
 
 # Mask-collapse guard: when two obj_ids' masks share too much IoU OR their
 # centroids are too close for too long, both are likely locked on the same hand.
@@ -923,6 +949,45 @@ def overlay_masks(frame_bgr: np.ndarray, masks_by_obj: dict[int, np.ndarray]) ->
     return out
 
 
+def truncate_video_to_frames(src: Path, max_frames: int, dst: Path) -> Path:
+    """Re-encode the first `max_frames` frames of `src` into `dst` via ffmpeg.
+
+    Keeps the source's FPS / dimensions; uses high-quality libx264 (-crf 18)
+    and strips audio. The caller is responsible for cleaning up `dst`.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", str(src),
+        "-frames:v", str(max_frames),
+        "-c:v", "libx264", "-crf", "18", "-an",
+        str(dst),
+    ]
+    subprocess.run(cmd, check=True)
+    return dst
+
+
+def decode_video_to_jpegs(video_path: Path, out_dir: Path) -> int:
+    """Use ffmpeg to write `<out_dir>/00000.jpg`, `00001.jpg`, ...
+
+    SAM 2's `init_state(video_path=<folder>)` expects this exact naming
+    (zero-padded frame index starting at 0). Returns the number of frames
+    written. `-q:v 2` is high-quality JPEG, comparable to the model input
+    after its internal resize.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", str(video_path),
+        "-q:v", "2", "-start_number", "0",
+        str(out_dir / "%05d.jpg"),
+    ]
+    subprocess.run(cmd, check=True)
+    n = len(list(out_dir.glob("*.jpg")))
+    if n == 0:
+        raise RuntimeError(f"ffmpeg produced no frames for {video_path}")
+    return n
+
+
 def pick_next_version_dir(base: Path) -> Path:
     base.mkdir(parents=True, exist_ok=True)
     n = 1
@@ -1044,75 +1109,94 @@ def _run_tracking_pass(
 
     # All SAM 2 video ops must run under bfloat16 autocast; otherwise certain
     # videos trigger a "mat1 BFloat16 / mat2 Float" mismatch in memory_attention.
+    # Long videos OOM the 4090 if frames + state both stay GPU-resident; offload
+    # past length thresholds (slower per-frame, but doesn't crash). For very
+    # long videos we also pre-decode to JPEG and let SAM 2 stream frames, since
+    # the mp4 code path tries to pack all frames into one tensor upfront.
+    offload_video = num_frames > OFFLOAD_VIDEO_FRAME_THRESHOLD
+    offload_state = num_frames > OFFLOAD_STATE_FRAME_THRESHOLD
+    use_jpeg_stream = num_frames > JPEG_STREAMING_FRAME_THRESHOLD
+    jpeg_tmp_dir: Path | None = None
+    if use_jpeg_stream:
+        jpeg_tmp_dir = Path(tempfile.mkdtemp(prefix=f"sam2_{video_path.stem}_", dir="/tmp"))
+        decode_video_to_jpegs(video_path, jpeg_tmp_dir)
+        init_video_path = str(jpeg_tmp_dir)
+    else:
+        init_video_path = str(video_path)
     backward_overrides_log: list[dict] = []
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        state = sam2_video.init_state(
-            video_path=str(video_path),
-            offload_video_to_cpu=False,
-            offload_state_to_cpu=False,
-        )
-        for frame_idx, entries in reseed_data.items():
-            for obj_id, _box, mask in entries:
-                sam2_video.add_new_mask(
-                    inference_state=state,
-                    frame_idx=frame_idx,
-                    obj_id=obj_id,
-                    mask=mask,
-                )
+    try:
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            state = sam2_video.init_state(
+                video_path=init_video_path,
+                offload_video_to_cpu=offload_video,
+                offload_state_to_cpu=offload_state,
+                async_loading_frames=use_jpeg_stream,
+            )
+            for frame_idx, entries in reseed_data.items():
+                for obj_id, _box, mask in entries:
+                    sam2_video.add_new_mask(
+                        inference_state=state,
+                        frame_idx=frame_idx,
+                        obj_id=obj_id,
+                        mask=mask,
+                    )
 
-        # Forward propagate through the whole video.
-        masks_per_frame: dict[int, dict[int, np.ndarray]] = {}
-        for fidx, obj_ids, mask_logits in sam2_video.propagate_in_video(state):
-            per_obj: dict[int, np.ndarray] = {}
-            for oid, logit in zip(obj_ids, mask_logits):
-                m = (logit > 0).cpu().numpy()
-                if m.ndim == 3:
-                    m = m[0]
-                per_obj[int(oid)] = m.astype(bool)
-            masks_per_frame[int(fidx)] = per_obj
-
-        # Backward-propagate to cover gaps between consecutive valid seeds,
-        # including the leading gap (0 -> first valid seed).
-        seed_frames = sorted(f for f in reseed_data.keys())
-        backprop_pairs: list[tuple[int, int]] = []
-        if seed_frames and seed_frames[0] > 0:
-            backprop_pairs.append((0, seed_frames[0]))
-        for i in range(len(seed_frames) - 1):
-            backprop_pairs.append((seed_frames[i], seed_frames[i + 1]))
-        for a, b in backprop_pairs:
-            n_track = b - a + 1
-            n_overridden = 0
-            for fidx, obj_ids, mask_logits in sam2_video.propagate_in_video(
-                state, start_frame_idx=b, max_frame_num_to_track=n_track, reverse=True,
-            ):
-                if fidx >= b or fidx < a:
-                    continue
-                if fidx in reseed_data:
-                    continue
+            # Forward propagate through the whole video.
+            masks_per_frame: dict[int, dict[int, np.ndarray]] = {}
+            for fidx, obj_ids, mask_logits in sam2_video.propagate_in_video(state):
                 per_obj: dict[int, np.ndarray] = {}
                 for oid, logit in zip(obj_ids, mask_logits):
                     m = (logit > 0).cpu().numpy()
                     if m.ndim == 3:
                         m = m[0]
                     per_obj[int(oid)] = m.astype(bool)
-                masks_per_frame.setdefault(int(fidx), {}).update(per_obj)
-                n_overridden += 1
-            backward_overrides_log.append({"pair": [a, b], "frames_overridden": n_overridden})
+                masks_per_frame[int(fidx)] = per_obj
 
-    # Lost-track redetection runs SAM 3 outside autocast and SAM 2 inside.
-    lost_track_report = redetect_lost_tracks(
-        masks_per_frame, video_path, sam2_video, state,
-        sam3_proc, sam3_model, mp_image,
-        reseed_frames=set(reseed_data.keys()),
-        image_size=(width, height),
-        device=device,
-        prompt=prompt,
-        score_threshold=score_threshold,
-        mask_threshold=mask_threshold,
-    )
+            # Backward-propagate to cover gaps between consecutive valid seeds,
+            # including the leading gap (0 -> first valid seed).
+            seed_frames = sorted(f for f in reseed_data.keys())
+            backprop_pairs: list[tuple[int, int]] = []
+            if seed_frames and seed_frames[0] > 0:
+                backprop_pairs.append((0, seed_frames[0]))
+            for i in range(len(seed_frames) - 1):
+                backprop_pairs.append((seed_frames[i], seed_frames[i + 1]))
+            for a, b in backprop_pairs:
+                n_track = b - a + 1
+                n_overridden = 0
+                for fidx, obj_ids, mask_logits in sam2_video.propagate_in_video(
+                    state, start_frame_idx=b, max_frame_num_to_track=n_track, reverse=True,
+                ):
+                    if fidx >= b or fidx < a:
+                        continue
+                    if fidx in reseed_data:
+                        continue
+                    per_obj: dict[int, np.ndarray] = {}
+                    for oid, logit in zip(obj_ids, mask_logits):
+                        m = (logit > 0).cpu().numpy()
+                        if m.ndim == 3:
+                            m = m[0]
+                        per_obj[int(oid)] = m.astype(bool)
+                    masks_per_frame.setdefault(int(fidx), {}).update(per_obj)
+                    n_overridden += 1
+                backward_overrides_log.append({"pair": [a, b], "frames_overridden": n_overridden})
 
-    sam2_video.reset_state(state)
-    del state
+        # Lost-track redetection runs SAM 3 outside autocast and SAM 2 inside.
+        lost_track_report = redetect_lost_tracks(
+            masks_per_frame, video_path, sam2_video, state,
+            sam3_proc, sam3_model, mp_image,
+            reseed_frames=set(reseed_data.keys()),
+            image_size=(width, height),
+            device=device,
+            prompt=prompt,
+            score_threshold=score_threshold,
+            mask_threshold=mask_threshold,
+        )
+
+        sam2_video.reset_state(state)
+        del state
+    finally:
+        if jpeg_tmp_dir is not None:
+            shutil.rmtree(jpeg_tmp_dir, ignore_errors=True)
 
     # NOTE: resolve_mask_collapse is intentionally NOT run here. It zeroes the
     # smaller of two overlapping masks, which would hide a full-screen collapse
@@ -1297,6 +1381,12 @@ def parse_args():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--output-base", default="outputs", help="Parent dir; subfolder track_v<N> auto-versioned.")
     ap.add_argument("--reverse", action="store_true", help="Process videos in reverse order.")
+    ap.add_argument(
+        "--max-sec", type=float, default=MAX_TRACK_SEC_DEFAULT,
+        help="Truncate each video to this many seconds before tracking "
+             "(0 or negative disables). SAM 2's frame loader keeps all loaded "
+             "frames in RAM, so beyond ~2000 frames (~66s) the process OOMs.",
+    )
     return ap.parse_args()
 
 
@@ -1322,34 +1412,75 @@ def main():
         videos = list(reversed(videos))
     print(f"Videos to process: {len(videos)} (order: {'reverse' if args.reverse else 'forward'})")
 
+    max_sec = args.max_sec if args.max_sec and args.max_sec > 0 else None
+    truncate_tmp_dir: Path | None = None
+    if max_sec is not None:
+        truncate_tmp_dir = Path(tempfile.mkdtemp(prefix="track_truncated_", dir="/tmp"))
+        print(f"Per-video cap: {max_sec:.1f}s (longer videos truncated into {truncate_tmp_dir})")
+
     summary = []
     t0 = time.time()
-    for i, vp in enumerate(videos, 1):
-        if not vp.exists():
-            print(f"  [{i}/{len(videos)}] {vp.name}: MISSING, skip")
-            continue
-        out_video = out_dir / f"{vp.stem}_track.mp4"
-        out_meta = out_dir / f"{vp.stem}_track.json"
-        out_frames = out_dir / f"{vp.stem}_track.frames.json"
-        tic = time.time()
-        try:
-            meta = track_one_video(
-                vp, out_video, out_meta, out_frames,
-                sam3_proc, sam3_model, sam2_video, mp_image, args.device, args.reseed_sec
-            )
-            summary.append(meta)
-            print(
-                f"  [{i}/{len(videos)}] {vp.name}: "
-                f"{len(meta.get('reseeds', []))} reseed pts, "
-                f"{meta.get('tracked_frames', 0)} tracked frames, "
-                f"{time.time()-tic:.1f}s"
-            )
-        except Exception as e:
-            print(f"  [{i}/{len(videos)}] {vp.name}: ERROR {e!r}")
-            summary.append({"video": vp.name, "error": repr(e)})
+    try:
+        for i, vp in enumerate(videos, 1):
+            if not vp.exists():
+                print(f"  [{i}/{len(videos)}] {vp.name}: MISSING, skip")
+                continue
+            tic = time.time()
+            # Pre-truncate any video over the cap into a temp mp4; track_one_video
+            # always sees a clip <= max_sec seconds long.
+            effective_path = vp
+            if max_sec is not None:
+                cap_probe = cv2.VideoCapture(str(vp))
+                src_fps = cap_probe.get(cv2.CAP_PROP_FPS) or 30.0
+                src_nframes = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap_probe.release()
+                src_dur = src_nframes / src_fps if src_fps > 0 else 0
+                if src_dur > max_sec:
+                    cap_frames = int(max_sec * src_fps)
+                    truncated = truncate_tmp_dir / vp.name
+                    truncate_video_to_frames(vp, cap_frames, truncated)
+                    effective_path = truncated
+                    print(f"  [{i}/{len(videos)}] {vp.name}: truncated {src_dur:.1f}s -> {max_sec:.1f}s ({cap_frames} frames)")
+            out_video = out_dir / f"{vp.stem}_track.mp4"
+            out_meta = out_dir / f"{vp.stem}_track.json"
+            out_frames = out_dir / f"{vp.stem}_track.frames.json"
+            try:
+                meta = track_one_video(
+                    effective_path, out_video, out_meta, out_frames,
+                    sam3_proc, sam3_model, sam2_video, mp_image, args.device, args.reseed_sec
+                )
+                # Stamp original-video info on the meta so callers know it was truncated.
+                if effective_path != vp:
+                    meta["truncated_from_video"] = vp.name
+                    meta["truncated_to_sec"] = max_sec
+                summary.append(meta)
+                print(
+                    f"  [{i}/{len(videos)}] {vp.name}: "
+                    f"{len(meta.get('reseeds', []))} reseed pts, "
+                    f"{meta.get('tracked_frames', 0)} tracked frames, "
+                    f"{time.time()-tic:.1f}s",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"  [{i}/{len(videos)}] {vp.name}: ERROR {e!r}", flush=True)
+                summary.append({"video": vp.name, "error": repr(e)})
+            finally:
+                # Drop truncated mp4 immediately (avoid disk + RAM accumulation).
+                if effective_path != vp:
+                    effective_path.unlink(missing_ok=True)
+                # Force release of any lingering inference state + cached
+                # frame tensors before moving on. Without this, AsyncVideoFrameLoader
+                # tensors from earlier videos can linger long enough to OOM-kill
+                # the process around video ~18 of a 60s-per-video run.
+                gc.collect()
+                if args.device.startswith("cuda"):
+                    torch.cuda.empty_cache()
 
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"\nDone. {len(summary)} videos processed in {time.time()-t0:.1f}s. Output: {out_dir}")
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"\nDone. {len(summary)} videos processed in {time.time()-t0:.1f}s. Output: {out_dir}")
+    finally:
+        if truncate_tmp_dir is not None:
+            shutil.rmtree(truncate_tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
