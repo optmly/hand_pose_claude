@@ -7,6 +7,17 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0010] - 2026-05-24
+
+### Docs
+- README: marked the hand-tracking + L / R labeling stages as complete at
+  the current release, and described the 0008-era tracker post-passes
+  (largest-CC bbox in the renderer, mask cleanup, frame-number overlay,
+  spike-filter collision avoidance, seed-frame label-swap fix). No code
+  changes -- this is purely a follow-up bump to keep VERSION /
+  CHANGELOG aligned with the documentation update that landed on top of
+  0009.
+
 ## [0009] - 2026-05-24
 
 ### Hand tracking + L/R labeling FINAL
