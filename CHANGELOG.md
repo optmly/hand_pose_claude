@@ -7,6 +7,33 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0009] - 2026-05-24
+
+### Hand tracking + L/R labeling FINAL
+
+This is the version we consider done for hand tracking on the
+`/mnt/data/ws/nv-data/full/` dataset (50 clips, capped at 30 s each):
+per-video hand mask tracking via SAM 3 seeds + SAM 2 propagation, plus
+SAM 3-based wearer L / R labeling. Future work on pose estimation will
+build on this output.
+
+### Tracker
+- Disabled `filter_cross_person_hands` in `track_one_video` (over-pruned
+  legitimate wearer-hand frames on multiple clips when triggered by a
+  high-in-frame mask centroid that turned out to still be a wearer hand).
+  The function is still defined so it can be re-enabled and tuned later.
+  All other 0008 fixes remain: largest-CC bbox in the renderer,
+  `cleanup_masks_largest_cc`, frame-number overlay, spike-filter collision
+  avoidance, and `fix_seed_label_swaps`.
+
+### Run on all 50 full-length clips (truncated to 30 s)
+- 50 / 50 tracked, 50 / 50 labeled cleanly.
+- 0 hand flips detected (centroid swap relative to f-1).
+- 0 empty or two-same L / R label assignments.
+- Per-video subprocess loop (one python invocation per input mp4) for
+  memory isolation; tracker outputs in `outputs/track_v1/` (run via
+  `bash /tmp/run_all_v8.sh`-style loop, see README for the recipe).
+
 ## [0008] - 2026-05-23
 
 ### Tracker -- visualization + post-pass robustness

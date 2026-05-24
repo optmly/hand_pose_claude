@@ -1500,12 +1500,11 @@ def track_one_video(
     # clean masks too.
     mask_cleanup_report = cleanup_masks_largest_cc(masks_per_frame)
 
-    # Cross-person hand filter: zero out runs where a mask's centroid sits in
-    # the top 20% of the frame for 5+ consecutive frames (rgb_17 obj_0 from
-    # f680+: SAM 2 drifted onto a co-worker reaching across the workspace).
-    cross_person_report = filter_cross_person_hands(
-        masks_per_frame, image_size=(width, height),
-    )
+    # NOTE: filter_cross_person_hands is intentionally disabled here.
+    # An earlier attempt to zero masks whose centroid sat in the top 20% of
+    # the frame for 5+ frames over-pruned legitimate wearer-hand frames in
+    # several videos. Keep the function defined for future tuning.
+    cross_person_report = {"disabled": True}
 
     # Fix Hungarian-induced 1-frame label swaps at seed frames before the
     # spike filter runs (so the spike filter sees a consistent trajectory).
