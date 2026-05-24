@@ -2,6 +2,12 @@
 
 Ego-centric hand detection, segmentation, tracking, and pose estimation.
 
+The hand-tracking and L / R labeling stages are considered complete at the
+current release: the tracker + labeler produce stable, consistent per-frame
+hand masks and bboxes (with wearer L / R labels) across the 50-clip
+`/mnt/data/ws/nv-data/full/` dataset truncated to 30 s each. Pose
+estimation continues to build on these outputs.
+
 The pipeline runs in two stages:
 
 1. **Tracking** ([src/track_video_sam2.py](src/track_video_sam2.py)):
@@ -11,9 +17,12 @@ The pipeline runs in two stages:
    and a mask-collapse guard. After the pass finishes, a full-screen-collapse
    detector (both obj_ids on the same blob, bbox + mask IoU >= 0.95) can
    trigger an automatic retry with the alternate SAM 3 prompt
-   `"egocentric first person's hands"`. Finally a mask-spike filter
-   replaces short-run mask anomalies (centroid jump or >2x area change that
-   recovers within ~20 frames) with the previous frame's mask.
+   `"egocentric first person's hands"`. A largest-CC mask cleanup removes
+   stray pixels, a seed-frame label-swap fix corrects Hungarian
+   misassignments when the wearer's hands cross between seeds, a mask-spike
+   filter (with collision avoidance against the other obj_id) replaces
+   short-run mask anomalies, and the renderer overlays the frame number
+   on every output frame for easier debugging.
 2. **Pose** ([src/pose_video_mp.py](src/pose_video_mp.py)): MediaPipe
    HandLandmarker in VIDEO mode, with a hull-area size gate against the
    tracker masks, a 50%-expanded-square image-mode rerun for failures,
