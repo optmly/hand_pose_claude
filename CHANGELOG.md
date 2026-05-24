@@ -7,6 +7,46 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0011] - 2026-05-24
+
+### Added
+- `src/pose_video_v2.py`: new hand-pose pipeline that runs MediaPipe
+  HandLandmarker (VIDEO mode, `num_hands=4`, conf 0.20) over each video
+  and, per tracker `obj_id`, picks the best candidate that passes a
+  gate suite anchored to the tracker mask convex hull (already computed
+  by `track_video_sam2.py`). Gates:
+  - **wrist-near-hull**: wrist landmark (lm 0) must be inside the mask
+    hull OR within 25% of the hull's bbox diagonal of its border. The
+    tracker masks are wrist-trimmed, so the wrist often sits just
+    outside; we don't require wrist-IN-mask.
+  - **kpts-in-hull**: >= 50% of the 21 keypoints must lie inside the
+    mask hull.
+  - **size sanity**: pose bbox area <= 2.5 * mask bbox area (catches
+    blow-up skeletons when a hand goes partially off-screen).
+  - **temporal jump**: per-kp mean displacement vs the most recently
+    accepted pose for this obj_id <= 10% of the image diagonal.
+- MP IMAGE-mode rerun on a 50%-expanded square crop around the mask
+  bbox when MP VIDEO produces no qualifying candidate; same gate suite
+  applied. Carry-forward of the previous accepted pose for up to 10
+  frames covers brief rejections.
+- L / R label per `obj_id` is read from the tracker's
+  `wearer_handedness_by_obj_id` (SAM 3 labeler from 0006); MP's
+  per-frame handedness is not used.
+
+### Initial result (20 clips at 10 s each, ~6000 frames per side)
+- Left: 4710 mp_video + 86 mp_image_rerun + 159 carryforward = 82%
+  accepted, 12% miss.
+- Right: 4909 + 37 + 82 = 84% accepted, 11% miss.
+- rgb_14 / rgb_15 (black gloves) are at 100% miss -- MP can't see
+  gloved hands. These need the ViTPose backup that will land in a
+  follow-up release.
+
+### Output
+- `outputs/pose_v<N>/<stem>_pose.json` per-frame keypoints + gate
+  diagnostics + source label (mp_video / mp_image_rerun / carryforward).
+- `outputs/pose_v<N>/<stem>_pose.mp4` overlay video: tracker mask +
+  mask hull polyline + 21-kp skeleton + L / R obj label + frame number.
+
 ## [0010] - 2026-05-24
 
 ### Docs

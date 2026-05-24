@@ -1,4 +1,4 @@
-# hand_pose_claude
+# Hand Tracking and Hand Pose Estimation 
 
 Ego-centric hand detection, segmentation, tracking, and pose estimation.
 
@@ -89,8 +89,14 @@ done
 python src/label_tracking_handedness.py --track-dir outputs/track_v<N>
 python src/label_tracking_handedness.py --track-dir outputs/track_v<N> --source-dir /path/to/source
 
-# 3) Pose estimation on the first N videos using the tracker masks
-python src/pose_video_mp.py --num 10 --track-dir outputs/track_v<N> --output-base outputs
+# 3) Pose estimation: MediaPipe HandLandmarker (VIDEO mode + IMAGE-mode rerun)
+#    gated against the tracker mask convex hulls. Writes <stem>_pose.{mp4,json}
+#    in a fresh outputs/pose_v<N>/.
+python src/pose_video_v2.py \
+    --track-dir outputs/track_v<N> \
+    --source-dir /path/to/source \
+    --num 20 \
+    --max-sec 10
 ```
 
 Each tracker run writes, per video:
