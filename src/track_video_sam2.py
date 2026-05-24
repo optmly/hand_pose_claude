@@ -138,6 +138,33 @@ FULL_COLLAPSE_MIN_FRAMES = 3
 MASK_SPIKE_CENTROID_JUMP_FRAC = 0.10
 MASK_SPIKE_AREA_RATIO = 2.0
 MASK_SPIKE_MAX_RUN = 20
+# When the spike filter would replace mask[oid] at frame f with a mask that
+# overlaps the OTHER obj_id's mask at f by >= this IoU, skip the replacement.
+# Prevents the filter from creating a collapse (rgb_03 ~26s: replacing obj_1's
+# seed-LEFT mask at f800 with the prior-frame RIGHT mask collided with obj_0's
+# already-RIGHT mask, yielding a 5-frame double-bbox).
+MASK_SPIKE_COLLISION_IOU = 0.30
+
+# Seed-frame label-swap fix: Hungarian at the seed step uses last_box_per_obj
+# (the prior seed's box) and can misassign obj_ids when the hands moved a lot
+# between seeds. We detect this AT EACH SEED FRAME by comparing the seed
+# masks at sf to the propagated masks at sf-1: if obj_0/obj_1 at sf are
+# closer to each other's prior-frame positions than to their own, we swap
+# labels at the seed frame only (1-frame correction, doesn't propagate
+# forward, so SAM 2's later revert keeps things consistent).
+SEED_LABEL_SWAP_MARGIN_PX = 20.0
+
+# Cross-person hand filter: in ego-centric video the wearer's hands almost
+# always sit in the middle / lower half of the frame (the wearer's body is
+# behind/below the camera, hands extend forward). A mask whose centroid sits
+# in the TOP CROSS_PERSON_TOP_FRAC of the frame for at least
+# CROSS_PERSON_MIN_RUN consecutive frames is almost always a hand belonging
+# to another person reaching across the workspace from the opposite side
+# (rgb_17 obj_0 from f680+: SAM 2 drift latched onto a co-worker's hand).
+# Zero out those frames so the visualization shows "lost" rather than the
+# wrong hand.
+CROSS_PERSON_TOP_FRAC = 0.20
+CROSS_PERSON_MIN_RUN = 5
 
 
 def _iou(a, b):
@@ -691,21 +718,142 @@ def filter_mask_spikes(
             if mask_prev is None or mask_prev.sum() == 0:
                 i += 1
                 continue
+            other_oid = 1 - oid
+            mask_prev_area = int(mask_prev.sum())
             spike_frames: list[int] = []
+            skipped_frames: list[int] = []
             for k in range(i, recovered_at):
                 fk = per_frame_ca[k][0]
+                # Collision avoidance: refuse to replace if the replacement
+                # mask overlaps the other obj_id's current mask at fk by >=
+                # MASK_SPIKE_COLLISION_IOU. Without this, "smoothing" obj_1
+                # back to its prior-frame side can land it on top of obj_0
+                # (rgb_03 ~26s).
+                other = masks_per_frame.get(fk, {}).get(other_oid)
+                if other is not None and other.sum() > 0:
+                    inter = int((mask_prev & other).sum())
+                    union = mask_prev_area + int(other.sum()) - inter
+                    iou = inter / union if union > 0 else 0.0
+                    if iou >= MASK_SPIKE_COLLISION_IOU:
+                        skipped_frames.append(int(fk))
+                        continue
                 masks_per_frame.setdefault(fk, {})[oid] = mask_prev.copy()
                 spike_frames.append(int(fk))
                 log["total_replacements"] += 1
-            if spike_frames:
-                replaced_runs.append({
-                    "start": spike_frames[0],
-                    "end": spike_frames[-1],
-                    "frames": spike_frames,
-                })
+            if spike_frames or skipped_frames:
+                entry = {}
+                if spike_frames:
+                    entry["start"] = spike_frames[0]
+                    entry["end"] = spike_frames[-1]
+                    entry["frames"] = spike_frames
+                if skipped_frames:
+                    entry["skipped_collision"] = skipped_frames
+                replaced_runs.append(entry)
             i = recovered_at + 1
         log["obj"][str(oid)] = replaced_runs
     return log
+
+
+def filter_cross_person_hands(
+    masks_per_frame: dict[int, dict[int, np.ndarray]],
+    image_size: tuple[int, int],
+    top_frac: float = CROSS_PERSON_TOP_FRAC,
+    min_run: int = CROSS_PERSON_MIN_RUN,
+) -> dict:
+    """Zero masks for any obj_id that sits with its centroid in the top
+    `top_frac` of the frame for at least `min_run` consecutive frames.
+
+    For ego-centric clips the wearer's hands rarely stay in the top of the
+    frame (the wearer's body is below/behind the camera). A sustained mask
+    in the top region is almost always SAM 2 drift onto a co-worker reaching
+    across the workspace. Marking those frames empty hides the wrong bbox
+    in the visualization rather than perpetuating the bad track.
+    """
+    W, H = image_size
+    top_y_cutoff = top_frac * H
+    log = {"obj": {}, "frames_zeroed": 0}
+    if not masks_per_frame:
+        return log
+    frames = sorted(masks_per_frame.keys())
+    for oid in (0, 1):
+        runs: list[tuple[int, int]] = []
+        run_start: int | None = None
+        for f in frames:
+            m = masks_per_frame[f].get(oid)
+            if m is None or m.sum() == 0:
+                if run_start is not None:
+                    runs.append((run_start, f - 1))
+                    run_start = None
+                continue
+            ys, _ = np.where(m)
+            cy = float(ys.mean())
+            if cy < top_y_cutoff:
+                if run_start is None:
+                    run_start = f
+            else:
+                if run_start is not None:
+                    runs.append((run_start, f - 1))
+                    run_start = None
+        if run_start is not None:
+            runs.append((run_start, frames[-1]))
+        zeroed_runs: list[dict] = []
+        for start, end in runs:
+            if end - start + 1 < min_run:
+                continue
+            for f in range(start, end + 1):
+                mf = masks_per_frame.get(f, {})
+                if oid in mf and mf[oid] is not None and mf[oid].sum() > 0:
+                    mf[oid] = np.zeros_like(mf[oid])
+                    log["frames_zeroed"] += 1
+            zeroed_runs.append({"start": int(start), "end": int(end)})
+        log["obj"][str(oid)] = zeroed_runs
+    return log
+
+
+def fix_seed_label_swaps(
+    masks_per_frame: dict[int, dict[int, np.ndarray]],
+    reseed_data: dict[int, list],
+    margin_px: float = SEED_LABEL_SWAP_MARGIN_PX,
+) -> dict:
+    """At each seed frame sf, if the seed masks for obj_0/obj_1 are closer to
+    the OTHER obj_id's mask at sf-1 than to their own, swap labels at sf.
+
+    Targets the Hungarian-at-the-seed misassignment when the wearer's hands
+    moved enough between seeds that the prior-seed boxes mislead the matcher
+    (rgb_03 f350: prior seed at f300 had both hands on the right side; new
+    seed at f350 had one LEFT and one RIGHT candidate; Hungarian matched
+    obj_0 to RIGHT and obj_1 to LEFT, opposite of the actual f349 identities).
+
+    Only swaps the seed frame itself. SAM 2 typically reverts to the prior
+    identity at sf+1 via memory_attention, so the 1-frame swap is enough to
+    restore continuity.
+    """
+    seed_frames = sorted(reseed_data.keys())
+    swap_log: list[dict] = []
+    for sf in seed_frames:
+        prev_f = sf - 1
+        if prev_f not in masks_per_frame or sf not in masks_per_frame:
+            continue
+        mp = masks_per_frame[prev_f]
+        ms = masks_per_frame[sf]
+        if 0 not in mp or 1 not in mp or 0 not in ms or 1 not in ms:
+            continue
+        cp0, _ = _mask_centroid_area(mp[0])
+        cp1, _ = _mask_centroid_area(mp[1])
+        cs0, _ = _mask_centroid_area(ms[0])
+        cs1, _ = _mask_centroid_area(ms[1])
+        if any(c is None for c in (cp0, cp1, cs0, cs1)):
+            continue
+        d_no = float(np.hypot(cs0[0]-cp0[0], cs0[1]-cp0[1])) + float(np.hypot(cs1[0]-cp1[0], cs1[1]-cp1[1]))
+        d_sw = float(np.hypot(cs0[0]-cp1[0], cs0[1]-cp1[1])) + float(np.hypot(cs1[0]-cp0[0], cs1[1]-cp0[1]))
+        if d_sw + margin_px < d_no:
+            ms[0], ms[1] = ms[1], ms[0]
+            swap_log.append({
+                "frame": int(sf),
+                "d_no_swap": d_no,
+                "d_swap": d_sw,
+            })
+    return {"swapped_frames": [s["frame"] for s in swap_log], "swap_log": swap_log}
 
 
 def trim_mask_at_wrist(
@@ -929,16 +1077,58 @@ def mask_bbox(mask: np.ndarray) -> list[float] | None:
     return [float(x), float(y), float(x + w - 1), float(y + h - 1)]
 
 
-def overlay_masks(frame_bgr: np.ndarray, masks_by_obj: dict[int, np.ndarray]) -> np.ndarray:
+def keep_largest_cc(mask: np.ndarray) -> np.ndarray:
+    """Return a new mask containing only the largest connected component.
+
+    SAM 2 occasionally emits tiny stray CCs far from the main hand blob
+    (e.g., a single-pixel remnant of a SAM 3 seed that was supposed to be
+    replaced). Those strays don't affect mask area materially but stretch
+    the rendered bbox to enclose them (the renderer uses np.where over all
+    mask pixels). Cleaning to the largest CC keeps mask/bbox/centroid
+    derivations all consistent.
+    """
+    if mask is None or mask.sum() == 0:
+        return mask
+    m_u8 = mask.astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m_u8, connectivity=8)
+    if num <= 2:
+        return mask  # single CC (num=2 = background + one CC), nothing to drop
+    biggest = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
+    return (labels == biggest)
+
+
+def cleanup_masks_largest_cc(masks_per_frame: dict[int, dict[int, np.ndarray]]) -> dict:
+    """Replace every mask in masks_per_frame with its largest connected
+    component. Returns a small log with how many frames / masks were cleaned."""
+    cleaned = 0
+    for fidx, per_obj in masks_per_frame.items():
+        for oid, m in list(per_obj.items()):
+            if m is None or m.sum() == 0:
+                continue
+            new_m = keep_largest_cc(m)
+            if new_m is not m and int(new_m.sum()) != int(m.sum()):
+                per_obj[oid] = new_m
+                cleaned += 1
+    return {"masks_cleaned": cleaned}
+
+
+def overlay_masks(
+    frame_bgr: np.ndarray,
+    masks_by_obj: dict[int, np.ndarray],
+    frame_idx: int | None = None,
+) -> np.ndarray:
     out = frame_bgr.copy()
+    H, W = out.shape[:2]
     for obj_id, mask in masks_by_obj.items():
         if mask is None or mask.sum() == 0:
             continue
         color = np.array(MASK_COLORS_BGR[obj_id % len(MASK_COLORS_BGR)], dtype=np.uint8)
         out[mask] = (0.45 * out[mask] + 0.55 * color).astype(np.uint8)
-        # bbox from mask + label
-        ys, xs = np.where(mask)
-        x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+        # Bbox from the LARGEST connected component, matching the JSON bbox.
+        bbox = mask_bbox(mask)
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = [int(round(v)) for v in bbox]
         col = tuple(int(c) for c in color)
         cv2.rectangle(out, (x1, y1), (x2, y2), col, 2)
         label = f"hand {obj_id}"
@@ -946,6 +1136,16 @@ def overlay_masks(frame_bgr: np.ndarray, masks_by_obj: dict[int, np.ndarray]) ->
         (tw, th), _ = cv2.getTextSize(label, font, 0.7, 2)
         cv2.rectangle(out, (x1, max(0, y1 - th - 6)), (x1 + tw + 4, y1), col, -1)
         cv2.putText(out, label, (x1 + 2, max(th, y1 - 4)), font, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+    # Frame number in the top-right corner for easy identification when
+    # iterating on tracker outputs.
+    if frame_idx is not None:
+        text = f"f{frame_idx}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (tw, th), _ = cv2.getTextSize(text, font, 0.8, 2)
+        x = W - tw - 12
+        y = th + 12
+        cv2.rectangle(out, (x - 4, y - th - 4), (x + tw + 4, y + 4), (0, 0, 0), -1)
+        cv2.putText(out, text, (x, y), font, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
     return out
 
 
@@ -1293,6 +1493,24 @@ def track_one_video(
     masks_per_frame = chosen["masks_per_frame"]
     reseed_data = chosen["reseed_data"]
 
+    # Clean masks to their largest connected component. SAM 2 occasionally
+    # emits tiny stray CCs far from the main hand blob, which inflate the
+    # rendered bbox even though the JSON bbox (which uses largest CC) looks
+    # fine. Run this BEFORE the collapse / spike passes so they operate on
+    # clean masks too.
+    mask_cleanup_report = cleanup_masks_largest_cc(masks_per_frame)
+
+    # Cross-person hand filter: zero out runs where a mask's centroid sits in
+    # the top 20% of the frame for 5+ consecutive frames (rgb_17 obj_0 from
+    # f680+: SAM 2 drifted onto a co-worker reaching across the workspace).
+    cross_person_report = filter_cross_person_hands(
+        masks_per_frame, image_size=(width, height),
+    )
+
+    # Fix Hungarian-induced 1-frame label swaps at seed frames before the
+    # spike filter runs (so the spike filter sees a consistent trajectory).
+    seed_label_swap_report = fix_seed_label_swaps(masks_per_frame, reseed_data)
+
     # Resolve in-pass mask collapses (smaller mask zeroed). Runs AFTER
     # detect_full_collapse + fallback retry so that full collapses still get a
     # chance to trigger the fallback path.
@@ -1318,7 +1536,7 @@ def track_one_video(
         if not ok:
             break
         masks = masks_per_frame.get(fidx, {})
-        overlay = overlay_masks(bgr, masks)
+        overlay = overlay_masks(bgr, masks, frame_idx=fidx)
         if fidx in reseed_data:
             cv2.putText(overlay, "SEED", (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                         (0, 0, 0), 4, cv2.LINE_AA)
@@ -1365,6 +1583,9 @@ def track_one_video(
         "wrist_trim": chosen["wrist_trim"],
         "seed_verification": chosen["seed_verification"],
         "lost_track_redetection": chosen["lost_track_redetection"],
+        "mask_cleanup_largest_cc": mask_cleanup_report,
+        "cross_person_filter": cross_person_report,
+        "seed_label_swap_fix": seed_label_swap_report,
         "mask_collapse_resolution": collapse_report,
         "mask_spike_filter": spike_report,
         "tracked_frames": len(masks_per_frame),

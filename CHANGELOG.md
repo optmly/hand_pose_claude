@@ -7,6 +7,38 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0008] - 2026-05-23
+
+### Tracker -- visualization + post-pass robustness
+- Render-bbox correctness: `overlay_masks` now draws bboxes from the largest
+  connected component (matching `mask_bbox` / the JSON bbox) instead of
+  `np.where(mask)` over all mask pixels. SAM 2 occasionally leaks a 1-3
+  pixel stray CC far from the main hand blob (e.g., rgb_09 f58 had a 3-px
+  stray at the bottom of the frame, left over from a SAM 3 seed there);
+  the renderer was stretching the bbox to enclose it and showing a tall
+  full-frame bbox even though the JSON was clean.
+- `cleanup_masks_largest_cc` post-pass: drops stray CCs from each frame's
+  mask before downstream collapse / spike / collision logic runs.
+- Frame number overlay (`f<N>`) in the top-right of every rendered frame so
+  it's easy to identify which frame a glitch is on.
+- Spike-filter collision avoidance: refuse to replace obj_X's spike-frame
+  mask with the prior-frame mask if doing so would create IoU >= 0.30 with
+  the OTHER obj_id's mask at that frame. Without this, the spike filter's
+  "smoothing" was creating 5-frame collapses at seed frames where Hungarian
+  had swapped obj_ids (rgb_03 ~26s).
+- Seed-frame label-swap fix: at each SAM 3 seed frame, if the new seed
+  masks for obj_0 / obj_1 are closer to the OTHER obj_id's f-1 mask than
+  to their own, swap labels at the seed frame only (1-frame correction;
+  SAM 2 typically reverts via memory_attention at sf+1 so the local swap
+  is enough). Resolves the rgb_03 "hand flip" at f350 / f450 / f500 /
+  f600 / f650 / f750 / f800 caused by Hungarian misassignment after the
+  wearer's hands crossed between seeds.
+- Cross-person hand filter: zero masks whose centroid sits in the top
+  20% of the frame for 5+ consecutive frames. In ego-centric video the
+  wearer's hands rarely stay near the top of the frame; sustained top-
+  of-frame masks are almost always SAM 2 drift onto a co-worker reaching
+  across the workspace (rgb_17 obj_0 from f680+).
+
 ## [0007] - 2026-05-23
 
 ### Tracker -- handle longer / full-length videos
