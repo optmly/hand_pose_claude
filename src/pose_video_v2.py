@@ -50,6 +50,9 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from pycocotools import mask as coco_mask
 
+# ViTPose backup is imported lazily on first need (lots of torch import time)
+# from .vitpose_runner import ViTPoseRunner
+
 MP_MODEL_PATHS = [
     Path("/home/jingjin/.cache/mediapipe/hand_landmarker.task"),
     Path(__file__).resolve().parents[1] / "models" / "hand_landmarker.task",
@@ -348,7 +351,8 @@ def draw_frame_number(img, fidx: int):
 # ──────────────────────── orchestration ────────────────────────
 
 def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
-                       mp_video, mp_image, max_frames: int | None = None) -> dict:
+                       mp_video, mp_image, max_frames: int | None = None,
+                       vitpose=None) -> dict:
     stem = video_path.stem
     frames_json_path = track_dir / f"{stem}_track.frames.json"
     track_json_path = track_dir / f"{stem}_track.json"
@@ -369,6 +373,13 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
     prev_pose: dict[int, np.ndarray | None] = {0: None, 1: None}
     prev_pose_age: dict[int, int] = {0: 0, 1: 0}     # frames since last accepted
     per_frame: list[dict] = []
+
+    # If ViTPose backup is available, run it once over the (truncated) clip
+    # and cache per-frame left/right hand keypoints. We only consult it when
+    # both MP VIDEO and MP IMAGE rerun have failed for an obj_id.
+    vit_active = vitpose is not None
+    if vit_active:
+        vitpose.run_video(video_path, max_frames=total_frames)
 
     out_video = out_dir / f"{stem}_pose.mp4"
     writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
@@ -443,6 +454,34 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                         entry["rejected_reason"] = "image_rerun_gate_fail"
                 else:
                     entry["rejected_reason"] = "image_rerun_no_detection"
+
+                # ViTPose backup: only when both MP attempts failed AND we
+                # know which anatomical side this obj_id is (the wearer
+                # L / R label from the tracker labeler). Pick the matching
+                # side's hand keypoints from the ViTPose pass and gate them.
+                if best is None and vit_active:
+                    side = handedness_by_oid.get(oid)
+                    if side in ("left", "right"):
+                        v_kpts, v_score = vitpose.get_for_side(video_path, fidx, side)
+                        if v_kpts is not None and v_kpts.shape == (21, 2):
+                            passes, gd = gate_candidate(
+                                v_kpts, hulls[oid], hull_diags[oid], mask_bboxes[oid],
+                            )
+                            entry["vitpose_gate_diag"] = gd
+                            entry["vitpose_mean_score"] = v_score
+                            if passes:
+                                best = {"keypoints": v_kpts, "score": v_score,
+                                        "handedness": side.capitalize()}
+                                entry["source"] = "vitpose_huge"
+                                entry["rejected_reason"] = None
+                            else:
+                                # Keep the prior rejected_reason from the MP
+                                # branch; tack on a vit qualifier so we can
+                                # tell which path the frame went through.
+                                if entry["rejected_reason"]:
+                                    entry["rejected_reason"] += "_then_vit_gate_fail"
+                                else:
+                                    entry["rejected_reason"] = "vit_gate_fail"
             else:
                 entry["source"] = "mp_video"
 
@@ -566,6 +605,13 @@ def parse_args():
     ap.add_argument("--max-sec", type=float, default=10.0,
                     help="Cap each video to N seconds (default 10).")
     ap.add_argument("--output-base", default="outputs")
+    ap.add_argument("--vitpose", action="store_true",
+                    help="Enable ViTPose-Huge wholebody as a final backup "
+                         "(after MP VIDEO + MP IMAGE rerun). Used only on "
+                         "frames where MP failed and the obj_id has a known "
+                         "wearer L/R label.")
+    ap.add_argument("--vitpose-ckpt", default=None,
+                    help="Override ViTPose checkpoint path.")
     return ap.parse_args()
 
 
@@ -589,6 +635,16 @@ def main():
 
     mp_image = make_mp(mp_vision.RunningMode.IMAGE, num_hands=MP_NUM_HANDS_IMAGE)
 
+    vitpose = None
+    if args.vitpose:
+        # Defer the import so the script starts fast when ViTPose is unused.
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from vitpose_runner import ViTPoseRunner, DEFAULT_CKPT  # type: ignore
+        ckpt = Path(args.vitpose_ckpt).expanduser() if args.vitpose_ckpt else DEFAULT_CKPT
+        print(f"ViTPose backup enabled. Checkpoint: {ckpt}")
+        vitpose = ViTPoseRunner(ckpt=ckpt)
+
     summary = []
     t0 = time.time()
     for i, stem in enumerate(stems, 1):
@@ -606,8 +662,11 @@ def main():
             cap.release()
             max_frames = int(round(args.max_sec * fps_native))
             res = process_one_video(video_path, track_dir, out_dir, mp_video, mp_image,
-                                     max_frames=max_frames)
+                                     max_frames=max_frames, vitpose=vitpose)
             mp_video.close()
+            if vitpose is not None:
+                # Drop this video's cache to avoid retaining all frames in RAM.
+                vitpose._cache.pop(video_path, None)
             summary.append(res)
             print(f"  [{i}/{len(stems)}] {stem}: done in {time.time()-tic:.1f}s")
         except Exception as e:

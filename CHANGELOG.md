@@ -7,6 +7,33 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0012] - 2026-05-24
+
+### Added
+- `src/vitpose_huge_wholebody.py`: pure-PyTorch ViTPose-Huge wholebody
+  model definition (~240 lines, 133 keypoints; uses indices 91-111 for
+  left hand and 112-132 for right hand).
+- `src/vitpose_runner.py`: per-video ViTPose pass that decodes the
+  48x64 heatmaps with UDP / DARK sub-pixel refinement (~10x more
+  accurate than argmax+sign at this resolution), caches the result
+  on the model, and exposes a `get_for_side(video, fidx, side)`
+  lookup used by the pose pipeline.
+- `pose_video_v2.py --vitpose`: enable ViTPose as the third source
+  (after MP VIDEO and MP IMAGE rerun). Picked only when both MP
+  attempts failed AND the obj_id has a known wearer L/R label; the
+  ViTPose hand keypoints for that side then go through the same
+  mask-hull / size-sanity gate suite. Runs lazily, once per video,
+  and frees its frame cache after each video to keep working-set
+  memory bounded.
+
+### Result (20 clips at 10 s each, ~6000 frames per side)
+- Left: mp_video 4716 (79%) + mp_image 94 + vitpose 631 (10.5%) +
+  carryforward 100 -> accepted 5541 (92.4%), miss 147 (2.5%).
+- Right: mp_video 4909 (82%) + mp_image 37 + vitpose 539 (9%) +
+  carryforward 90 -> accepted 5575 (93%), miss 113 (1.9%).
+- Black-gloved clips rgb_14 / rgb_15 went from 100% miss in 0011 to
+  ~99% / ~90% L+R covered, entirely via ViTPose.
+
 ## [0011] - 2026-05-24
 
 ### Added

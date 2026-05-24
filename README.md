@@ -90,14 +90,23 @@ python src/label_tracking_handedness.py --track-dir outputs/track_v<N>
 python src/label_tracking_handedness.py --track-dir outputs/track_v<N> --source-dir /path/to/source
 
 # 3) Pose estimation: MediaPipe HandLandmarker (VIDEO mode + IMAGE-mode rerun)
-#    gated against the tracker mask convex hulls. Writes <stem>_pose.{mp4,json}
-#    in a fresh outputs/pose_v<N>/.
+#    gated against the tracker mask convex hulls. Add --vitpose to enable
+#    ViTPose-Huge wholebody as the final backup (covers gloved-hand clips
+#    that MP can't detect). Writes <stem>_pose.{mp4,json} in a fresh
+#    outputs/pose_v<N>/.
 python src/pose_video_v2.py \
     --track-dir outputs/track_v<N> \
     --source-dir /path/to/source \
     --num 20 \
-    --max-sec 10
+    --max-sec 10 \
+    --vitpose
 ```
+
+The ViTPose checkpoint is expected at:
+
+    ~/.cache/huggingface/hub/models--JunkyByte--easy_ViTPose/snapshots/*/torch/wholebody/vitpose-h-wholebody.pth
+
+Override with `--vitpose-ckpt /path/to/vitpose-h-wholebody.pth`.
 
 Each tracker run writes, per video:
 
