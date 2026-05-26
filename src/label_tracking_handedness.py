@@ -146,11 +146,18 @@ def determine_handedness(
     sam3_proc, sam3_model,
     device: str,
     n_samples: int = N_SAMPLE_FRAMES,
+    sam3_video_path: Path | None = None,
 ) -> tuple[dict[int, str], dict[int, dict[str, float]], dict[int, dict[str, int]]]:
     """Sample frames; at each, run SAM 3 with `SAM3_LEFT_PROMPT` and
     `SAM3_RIGHT_PROMPT` and match each detection to the nearest tracker
     obj_id by centroid distance. Returns the final L/R assignment plus
     confidence-weighted vote sums and raw counts.
+
+    If `sam3_video_path` is given and differs from `video_path`, SAM 3 reads
+    its inputs from sam3_video_path (typically source resolution) while
+    obj_id matching stays in the downsampled coordinate frame of
+    `video_path` (where the tracker bboxes live). SAM 3 detection bboxes are
+    scaled from source-res to downsampled-res before matching.
 
     Final assignment uses joint-max on confidence sums for the two-obj_id
     case (the wearer's two hands are anatomically opposite, so the (Left,
@@ -167,15 +174,26 @@ def determine_handedness(
     score_sums: dict[int, dict[str, float]] = {}
     counts: dict[int, dict[str, int]] = {}
 
+    use_dual = sam3_video_path is not None and sam3_video_path != video_path
     cap = cv2.VideoCapture(str(video_path))
+    cap_sam3 = cv2.VideoCapture(str(sam3_video_path)) if use_dual else None
+    sam3_W, sam3_H = W, H
+    if cap_sam3 is not None:
+        sam3_W = int(cap_sam3.get(cv2.CAP_PROP_FRAME_WIDTH))
+        sam3_H = int(cap_sam3.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fidx = 0
     while True:
         ok, bgr = cap.read()
         if not ok:
             break
+        bgr_sam3 = bgr
+        if cap_sam3 is not None:
+            ok_s, bgr_s = cap_sam3.read()
+            if ok_s:
+                bgr_sam3 = bgr_s
         if fidx in needed:
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(rgb)
+            rgb_sam3 = cv2.cvtColor(bgr_sam3, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb_sam3)
             frame_meta = frames[fidx]
             obj_bboxes: dict[int, list[float]] = {}
             for h in frame_meta["hands"]:
@@ -188,6 +206,13 @@ def determine_handedness(
                     if det is None:
                         continue
                     det_bbox, det_score = det
+                    if use_dual:
+                        sx = W / float(sam3_W)
+                        sy = H / float(sam3_H)
+                        det_bbox = np.array([
+                            det_bbox[0] * sx, det_bbox[1] * sy,
+                            det_bbox[2] * sx, det_bbox[3] * sy,
+                        ], dtype=np.float32)
                     matched_oid = match_to_obj_id(det_bbox, obj_bboxes, image_diag)
                     if matched_oid is None:
                         continue
@@ -197,6 +222,8 @@ def determine_handedness(
                     cd[label] += 1
         fidx += 1
     cap.release()
+    if cap_sam3 is not None:
+        cap_sam3.release()
 
     handedness: dict[int, str] = {}
     eligible = [oid for oid, d in counts.items() if d["Left"] + d["Right"] >= MIN_VOTES_TO_LABEL]
@@ -284,10 +311,18 @@ def process_one(track_dir: Path, video_stem: str, source_dir: Path, sam3_proc, s
         return {"video": video_stem, "error": "source mp4 missing"}
     if not frames_json.exists():
         return {"video": video_stem, "error": "frames json missing"}
+    # Dual-resolution SAM 3: if src_<stem>.mp4 lives next to <stem>.mp4 (the
+    # tracker persists it when --max-short-edge is set), feed it to SAM 3 for
+    # better text-prompt recall while keeping the rest of the pipeline in the
+    # downsampled coordinate frame.
+    sam3_video_path = source_dir / f"src_{video_stem}.mp4"
+    if not sam3_video_path.exists():
+        sam3_video_path = None
 
     frames_meta = json.loads(frames_json.read_text())
     handedness, score_sums, counts = determine_handedness(
-        video_path, frames_meta, sam3_proc, sam3_model, device
+        video_path, frames_meta, sam3_proc, sam3_model, device,
+        sam3_video_path=sam3_video_path,
     )
     render_labeled_video(video_path, frames_meta, handedness, out_video)
 

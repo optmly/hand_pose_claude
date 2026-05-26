@@ -71,6 +71,11 @@ WRIST_HULL_MAX_DIST_FRAC = 0.25
 # mask convex hull (strict pointPolygonTest, no buffer). Loose enough to
 # admit extended fingers / open hands that reach slightly past the mask.
 MIN_KPTS_IN_HULL_FRAC = 0.50
+# Expand the convex hull by this factor (about its centroid) before the
+# kpts-in-hull check. Fingertips frequently extend a few px past the SAM-mask
+# hull on otherwise-correct MP detections; a slight outward dilation lets
+# those poses through without loosening the threshold itself.
+KPTS_HULL_EXPAND_FRAC = 0.20
 # Size sanity: a candidate pose whose bbox area exceeds this multiple of
 # the mask bbox area is treated as a hallucination.
 POSE_BBOX_MAX_RATIO = 2.5
@@ -80,8 +85,23 @@ CONSISTENCY_MAX_PX_FRAC = 0.10
 # How long a stretch of rejections may "carry forward" the previous pose
 # instead of leaving the frame empty.
 CONT_CARRYFWD_MAX_FRAMES = 10
-# IMAGE-mode rerun crop expansion (fraction of mask bbox, square)
+# IMAGE-mode rerun crop expansion (fraction of mask bbox, square) — legacy.
 RERUN_BBOX_EXPAND = 0.50
+# Mask-dilation expansion: kernel radius as a fraction of mask bbox diagonal.
+# 0.10 gives roughly +50% mask area for a typical hand mask. The dilated mask
+# becomes the crop (tight) AND the binary mask is used to zero out background
+# pixels in the crop fed to MP image -- removes co-worker hands / scene clutter.
+MASK_RERUN_DILATE_FRAC = 0.10
+# Wide-crop MP image fallback: square crop expanded by this fraction of the
+# mask bbox's longer side, no background zeroing. Gives MP enough surrounding
+# context (wrist, forearm, scene anchor) to lock onto closed-fist / dorsal
+# hand views that the tight mask-zeroed crop misses.
+MP_WIDE_CROP_EXPAND_FRAC = 0.75
+# Single-resolution MP video: downsample each frame to this short-edge size
+# before feeding it to MP. None = use source resolution. 1024 keeps the
+# detector cheap while remaining well above MP's internal 256x192 working
+# size. Landmark coords are rescaled back into source-frame coordinates.
+MP_VIDEO_SHORT_EDGE = 1024
 # Minimum mask area for which we even bother running a pose detector.
 MIN_MASK_AREA_PX = 2000
 
@@ -186,6 +206,33 @@ def mp_pts_in_crop_to_image(landmarks, crop) -> np.ndarray:
     return np.array([[sx1 + lm.x * cw, sy1 + lm.y * ch] for lm in landmarks], dtype=np.float32)
 
 
+def dilate_mask_to_crop(mask: np.ndarray,
+                         expand_frac: float = MASK_RERUN_DILATE_FRAC
+                         ) -> tuple[np.ndarray | None, tuple[int, int, int, int]]:
+    """Return (dilated_mask_HxW_bool, dilated_bbox_xyxy).
+
+    Dilates the input mask with a circular kernel of radius = expand_frac
+    * mask_bbox_diagonal. ~+50% area when expand_frac == 0.10 for a typical
+    hand mask. Returns (None, (0,0,0,0)) for an empty mask.
+    """
+    if mask is None or mask.sum() == 0:
+        return None, (0, 0, 0, 0)
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return None, (0, 0, 0, 0)
+    diag = float(np.hypot(xs.max() - xs.min(), ys.max() - ys.min()))
+    k = max(3, int(round(expand_frac * diag)))
+    if k % 2 == 0:
+        k += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    dilated = cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
+    dy, dx = np.where(dilated)
+    if len(dx) == 0:
+        return None, (0, 0, 0, 0)
+    bbox = (int(dx.min()), int(dy.min()), int(dx.max()) + 1, int(dy.max()) + 1)
+    return dilated, bbox
+
+
 # ──────────────────────── gates ────────────────────────
 
 def gate_wrist_near_hull(wrist_xy: np.ndarray, hull: np.ndarray, hull_diag: float
@@ -201,11 +248,40 @@ def gate_wrist_near_hull(wrist_xy: np.ndarray, hull: np.ndarray, hull_diag: floa
     return (dist >= thresh), dist, thresh
 
 
+def _expand_hull(hull: np.ndarray, expand_frac: float) -> np.ndarray:
+    """Scale a convex hull about its centroid by (1 + expand_frac)."""
+    pts = hull.reshape(-1, 2).astype(np.float32)
+    centroid = pts.mean(axis=0, keepdims=True)
+    return ((pts - centroid) * (1.0 + expand_frac) + centroid).reshape(hull.shape)
+
+
+def snap_pose_to_mask(held_kpts: np.ndarray, mask_hull: np.ndarray,
+                       hull_diag: float) -> np.ndarray:
+    """Translate + scale a held pose so its centroid aligns with the mask
+    hull centroid and its bbox diagonal matches the hull diagonal. Used
+    during carryforward when the underlying detector failed but the mask
+    still locates the hand -- keeps the held skeleton visually anchored to
+    the actual hand location instead of drifting at the stale frame's
+    coordinates.
+    """
+    if mask_hull is None or hull_diag <= 0:
+        return held_kpts
+    held = held_kpts.astype(np.float32)
+    held_centroid = held.mean(axis=0)
+    bbox_w = float(held[:, 0].max() - held[:, 0].min())
+    bbox_h = float(held[:, 1].max() - held[:, 1].min())
+    held_diag = float(np.hypot(bbox_w, bbox_h))
+    mask_centroid = mask_hull.reshape(-1, 2).astype(np.float32).mean(axis=0)
+    scale = (hull_diag / held_diag) if held_diag > 1e-3 else 1.0
+    return (held - held_centroid) * scale + mask_centroid
+
+
 def gate_kpts_in_hull(kpts: np.ndarray, hull: np.ndarray) -> tuple[bool, float]:
-    """At least MIN_KPTS_IN_HULL_FRAC of the 21 kpts must be inside the hull."""
+    """At least MIN_KPTS_IN_HULL_FRAC of the 21 kpts must lie inside the
+    convex hull, expanded by KPTS_HULL_EXPAND_FRAC about its centroid."""
     if hull is None:
         return False, 0.0
-    h = hull.astype(np.float32)
+    h = _expand_hull(hull, KPTS_HULL_EXPAND_FRAC).astype(np.float32)
     inside = 0
     for (x, y) in kpts:
         if cv2.pointPolygonTest(h, (float(x), float(y)), False) >= 0:
@@ -237,21 +313,34 @@ def gate_temporal_jump(kpts: np.ndarray, prev_kpts: np.ndarray | None,
 
 # ──────────────────────── MP wrappers ────────────────────────
 
-def run_mp_video_frame(landmarker, frame_rgb: np.ndarray, ts_ms: int) -> list[dict]:
+def run_mp_video_frame(landmarker, frame_rgb: np.ndarray, ts_ms: int,
+                        out_W: int | None = None, out_H: int | None = None
+                        ) -> list[dict]:
+    """Run MP video on `frame_rgb`. If out_W/out_H are given, scale the
+    normalized landmarks into (out_W, out_H) rather than the frame's own
+    dimensions -- useful when feeding MP a downsampled frame but you want
+    kpts in the source-resolution coordinate frame."""
     img = mp.Image(image_format=mp.ImageFormat.SRGB,
                    data=np.ascontiguousarray(frame_rgb))
     res = landmarker.detect_for_video(img, int(ts_ms))
     H, W = frame_rgb.shape[:2]
+    target_w = out_W if out_W is not None else W
+    target_h = out_H if out_H is not None else H
     out = []
     for i, lms in enumerate(res.hand_landmarks):
-        pts = mp_pts_to_image(lms, W, H)
+        pts = mp_pts_to_image(lms, target_w, target_h)
         score = float(res.handedness[i][0].score) if (res.handedness and i < len(res.handedness)) else 0.0
         handed = res.handedness[i][0].category_name if (res.handedness and i < len(res.handedness)) else None
-        out.append({"keypoints": pts, "score": score, "handedness": handed})
+        # MP HandLandmarker doesn't expose per-keypoint confidences; the
+        # hand-level score is the best we have. Broadcast it to (21,).
+        kp_conf = np.full(21, score, dtype=np.float32)
+        out.append({"keypoints": pts, "score": score, "handedness": handed,
+                     "kp_confidences": kp_conf})
     return out
 
 
 def run_mp_image_crop(landmarker, frame_rgb: np.ndarray, crop) -> dict | None:
+    """Legacy bbox-only image rerun (kept for compatibility)."""
     sx1, sy1, sx2, sy2 = crop
     if sx2 <= sx1 or sy2 <= sy1:
         return None
@@ -265,7 +354,93 @@ def run_mp_image_crop(landmarker, frame_rgb: np.ndarray, crop) -> dict | None:
     pts = mp_pts_in_crop_to_image(res.hand_landmarks[0], crop)
     score = float(res.handedness[0][0].score) if res.handedness else 0.0
     handed = res.handedness[0][0].category_name if res.handedness else None
-    return {"keypoints": pts, "score": score, "handedness": handed}
+    kp_conf = np.full(21, score, dtype=np.float32)
+    return {"keypoints": pts, "score": score, "handedness": handed,
+             "kp_confidences": kp_conf}
+
+
+def run_mp_image_masked(landmarker, frame_rgb: np.ndarray, mask: np.ndarray
+                         ) -> dict | None:
+    """MP image rerun on a mask-derived crop with background zeroed out.
+
+    Steps:
+      1. Dilate the input mask by ~10% of its bbox diagonal (≈ +50% area).
+      2. Crop to the dilated mask's bbox.
+      3. Zero pixels outside the dilated mask within the crop. This focuses
+         MP on the hand and removes co-worker hands / scene clutter that
+         could otherwise compete with the wearer hand for the detection.
+    """
+    dilated, bbox = dilate_mask_to_crop(mask)
+    if dilated is None:
+        return None
+    sx1, sy1, sx2, sy2 = bbox
+    if sx2 <= sx1 or sy2 <= sy1:
+        return None
+    sub = frame_rgb[sy1:sy2, sx1:sx2].copy()
+    sub_mask = dilated[sy1:sy2, sx1:sx2]
+    sub[~sub_mask] = 0
+    if sub.size == 0:
+        return None
+    img = mp.Image(image_format=mp.ImageFormat.SRGB,
+                   data=np.ascontiguousarray(sub))
+    res = landmarker.detect(img)
+    if not res.hand_landmarks:
+        return None
+    pts = mp_pts_in_crop_to_image(res.hand_landmarks[0], bbox)
+    score = float(res.handedness[0][0].score) if res.handedness else 0.0
+    handed = res.handedness[0][0].category_name if res.handedness else None
+    kp_conf = np.full(21, score, dtype=np.float32)
+    return {"keypoints": pts, "score": score, "handedness": handed,
+             "kp_confidences": kp_conf}
+
+
+def run_mp_image_wide(landmarker, frame_rgb: np.ndarray, mask: np.ndarray,
+                       expand_frac: float = MP_WIDE_CROP_EXPAND_FRAC
+                       ) -> dict | None:
+    """MP image rerun on a WIDER square crop around the mask, without background
+    zeroing. Falls back from `run_mp_image_masked` when the tight + zeroed crop
+    is too context-starved (small hands, closed-fist / dorsal views).
+
+    Square crop = mask bbox expanded by `expand_frac` * max(bw, bh) on each
+    side, then squared. No mask multiplication — MP sees the surrounding
+    scene as anchor.
+    """
+    if mask is None or mask.sum() == 0:
+        return None
+    H, W = frame_rgb.shape[:2]
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return None
+    x1, y1 = int(xs.min()), int(ys.min())
+    x2, y2 = int(xs.max()) + 1, int(ys.max()) + 1
+    bw, bh = (x2 - x1), (y2 - y1)
+    pad = int(round(expand_frac * max(bw, bh)))
+    # Expand then square
+    sx1, sy1 = x1 - pad, y1 - pad
+    sx2, sy2 = x2 + pad, y2 + pad
+    side = max(sx2 - sx1, sy2 - sy1)
+    cx = (sx1 + sx2) // 2
+    cy = (sy1 + sy2) // 2
+    half = side // 2
+    sx1, sy1 = cx - half, cy - half
+    sx2, sy2 = sx1 + side, sy1 + side
+    sx1 = max(0, sx1); sy1 = max(0, sy1)
+    sx2 = min(W, sx2); sy2 = min(H, sy2)
+    if sx2 - sx1 < 16 or sy2 - sy1 < 16:
+        return None
+    sub = np.ascontiguousarray(frame_rgb[sy1:sy2, sx1:sx2])
+    if sub.size == 0:
+        return None
+    img = mp.Image(image_format=mp.ImageFormat.SRGB, data=sub)
+    res = landmarker.detect(img)
+    if not res.hand_landmarks:
+        return None
+    pts = mp_pts_in_crop_to_image(res.hand_landmarks[0], (sx1, sy1, sx2, sy2))
+    score = float(res.handedness[0][0].score) if res.handedness else 0.0
+    handed = res.handedness[0][0].category_name if res.handedness else None
+    kp_conf = np.full(21, score, dtype=np.float32)
+    return {"keypoints": pts, "score": score, "handedness": handed,
+             "kp_confidences": kp_conf}
 
 
 # ──────────────────────── per-frame selection ────────────────────────
@@ -352,7 +527,8 @@ def draw_frame_number(img, fidx: int):
 
 def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                        mp_video, mp_image, max_frames: int | None = None,
-                       vitpose=None) -> dict:
+                       vitpose=None,
+                       mp_video_short_edge: int | None = None) -> dict:
     stem = video_path.stem
     frames_json_path = track_dir / f"{stem}_track.frames.json"
     track_json_path = track_dir / f"{stem}_track.json"
@@ -410,8 +586,16 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
             hulls[oid] = hull
             hull_diags[oid] = diag
 
-        # MP VIDEO pass
-        mp_dets = run_mp_video_frame(mp_video, rgb, ts_ms)
+        # MP VIDEO pass at a single (possibly downsampled) resolution.
+        # Landmark coords are rescaled into source-frame coordinates via
+        # the out_W / out_H args.
+        if mp_video_short_edge is not None and min(W, H) > mp_video_short_edge:
+            scale = mp_video_short_edge / float(min(W, H))
+            new_w, new_h = int(round(W * scale)), int(round(H * scale))
+            rgb_for_mp = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            rgb_for_mp = rgb
+        mp_dets = run_mp_video_frame(mp_video, rgb_for_mp, ts_ms, out_W=W, out_H=H)
 
         frame_record = {"frame": fidx, "hands": []}
         accepted_pts: dict[int, np.ndarray] = {}
@@ -420,6 +604,7 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                 "obj_id": oid,
                 "source": None,
                 "keypoints": None,
+                "kp_confidences": None,
                 "wearer_handedness": handedness_by_oid.get(oid),
                 "mp_score": None,
                 "rejected_reason": None,
@@ -439,9 +624,10 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
             entry["candidates_diag"] = diag_per_cand
 
             if best is None:
-                # IMAGE-mode rerun on mask-bbox crop
-                crop = expand_to_square_crop(mask_bboxes[oid], W, H)
-                rerun = run_mp_image_crop(mp_image, rgb, crop)
+                # IMAGE-mode rerun on the mask-derived crop (dilated mask
+                # bbox, with background pixels outside the dilated mask
+                # zeroed). Focuses MP on the actual hand pixels.
+                rerun = run_mp_image_masked(mp_image, rgb, masks[oid])
                 if rerun is not None:
                     passes, gd = gate_candidate(
                         rerun["keypoints"], hulls[oid], hull_diags[oid], mask_bboxes[oid],
@@ -455,6 +641,32 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                 else:
                     entry["rejected_reason"] = "image_rerun_no_detection"
 
+                # Wide-crop MP image fallback: square crop expanded around the
+                # mask, no background zeroing. Gives MP enough surrounding
+                # context for closed-fist / dorsal-view / small-mask cases
+                # where the tight masked crop is too context-starved.
+                if best is None:
+                    wide = run_mp_image_wide(mp_image, rgb, masks[oid])
+                    if wide is not None:
+                        passes, gd = gate_candidate(
+                            wide["keypoints"], hulls[oid], hull_diags[oid], mask_bboxes[oid],
+                        )
+                        entry["wide_gate_diag"] = gd
+                        if passes:
+                            best = wide
+                            entry["source"] = "mp_image_rerun_wide"
+                            entry["rejected_reason"] = None
+                        else:
+                            entry["rejected_reason"] = (
+                                (entry["rejected_reason"] or "") + "_then_wide_gate_fail"
+                                if entry["rejected_reason"] else "wide_gate_fail"
+                            )
+                    else:
+                        entry["rejected_reason"] = (
+                            (entry["rejected_reason"] or "") + "_then_wide_no_detection"
+                            if entry["rejected_reason"] else "wide_no_detection"
+                        )
+
                 # ViTPose backup: only when both MP attempts failed AND we
                 # know which anatomical side this obj_id is (the wearer
                 # L / R label from the tracker labeler). Pick the matching
@@ -462,22 +674,21 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                 if best is None and vit_active:
                     side = handedness_by_oid.get(oid)
                     if side in ("left", "right"):
-                        v_kpts, v_score = vitpose.get_for_side(video_path, fidx, side)
+                        v_kpts, v_kp_scores = vitpose.get_for_side(video_path, fidx, side)
                         if v_kpts is not None and v_kpts.shape == (21, 2):
                             passes, gd = gate_candidate(
                                 v_kpts, hulls[oid], hull_diags[oid], mask_bboxes[oid],
                             )
+                            v_mean = float(v_kp_scores.mean()) if v_kp_scores is not None else 0.0
                             entry["vitpose_gate_diag"] = gd
-                            entry["vitpose_mean_score"] = v_score
+                            entry["vitpose_mean_score"] = v_mean
                             if passes:
-                                best = {"keypoints": v_kpts, "score": v_score,
-                                        "handedness": side.capitalize()}
+                                best = {"keypoints": v_kpts, "score": v_mean,
+                                        "handedness": side.capitalize(),
+                                        "kp_confidences": v_kp_scores}
                                 entry["source"] = "vitpose_huge"
                                 entry["rejected_reason"] = None
                             else:
-                                # Keep the prior rejected_reason from the MP
-                                # branch; tack on a vit qualifier so we can
-                                # tell which path the frame went through.
                                 if entry["rejected_reason"]:
                                     entry["rejected_reason"] += "_then_vit_gate_fail"
                                 else:
@@ -495,20 +706,39 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                     entry["rejected_reason"] = f"temporal_jump_{jump_px:.0f}px"
                     if prev_pose[oid] is not None and prev_pose_age[oid] < CONT_CARRYFWD_MAX_FRAMES:
                         entry["source"] = "carryforward"
-                        entry["keypoints"] = prev_pose[oid].copy()
+                        entry["keypoints"] = snap_pose_to_mask(
+                            prev_pose[oid], hulls[oid], hull_diags[oid],
+                        )
+                        entry["kp_confidences"] = np.full(21, 0.05, dtype=np.float32)
                         prev_pose_age[oid] += 1
                     else:
+                        # Carryforward window exhausted: release the stale
+                        # prev_pose so the next fresh detection can re-acquire.
+                        # Without this, prev_pose is pinned forever and every
+                        # subsequent MP-video detection is rejected as a jump
+                        # against a many-frames-old pose.
                         entry["keypoints"] = None
+                        prev_pose[oid] = None
+                        prev_pose_age[oid] = CONT_CARRYFWD_MAX_FRAMES
                 else:
                     entry["keypoints"] = best["keypoints"]
                     entry["mp_score"] = best["score"]
+                    entry["kp_confidences"] = best.get("kp_confidences")
                     prev_pose[oid] = best["keypoints"]
                     prev_pose_age[oid] = 0
             else:
                 # No accepted candidate; try carry-forward
                 if prev_pose[oid] is not None and prev_pose_age[oid] < CONT_CARRYFWD_MAX_FRAMES:
                     entry["source"] = "carryforward"
-                    entry["keypoints"] = prev_pose[oid].copy()
+                    # Snap held pose to the current mask hull so the rendered
+                    # skeleton stays anchored to the actual hand location.
+                    entry["keypoints"] = snap_pose_to_mask(
+                        prev_pose[oid], hulls[oid], hull_diags[oid],
+                    )
+                    # Carryforward is uncertain; mark per-kp confidence low so
+                    # the downstream Kalman smoother trusts the model over
+                    # the held value.
+                    entry["kp_confidences"] = np.full(21, 0.05, dtype=np.float32)
                     prev_pose_age[oid] += 1
                 else:
                     prev_pose[oid] = None
@@ -542,7 +772,7 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
     cap.release()
     writer.release()
 
-    # Serialize keypoints as lists
+    # Serialize keypoints + confidences as lists
     serial = []
     for rec in per_frame:
         hands_out = []
@@ -550,6 +780,8 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
             hh = dict(h)
             if isinstance(hh.get("keypoints"), np.ndarray):
                 hh["keypoints"] = hh["keypoints"].tolist()
+            if isinstance(hh.get("kp_confidences"), np.ndarray):
+                hh["kp_confidences"] = [float(c) for c in hh["kp_confidences"]]
             hands_out.append(hh)
         serial.append({"frame": rec["frame"], "hands": hands_out})
 
@@ -568,6 +800,8 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
             "consistency_max_px_frac": CONSISTENCY_MAX_PX_FRAC,
             "cont_carryfwd_max_frames": CONT_CARRYFWD_MAX_FRAMES,
             "min_mask_area_px": MIN_MASK_AREA_PX,
+            "mask_rerun_dilate_frac": MASK_RERUN_DILATE_FRAC,
+            "mp_video_short_edge": MP_VIDEO_SHORT_EDGE,
         },
         "frames": serial,
     }
@@ -655,14 +889,17 @@ def main():
             continue
         tic = time.time()
         try:
-            # MP VIDEO mode needs a fresh landmarker per video (monotonic ts_ms)
+            # MP VIDEO mode needs a fresh landmarker per video (monotonic ts_ms).
             mp_video = make_mp(mp_vision.RunningMode.VIDEO, num_hands=MP_NUM_HANDS_VIDEO)
             cap = cv2.VideoCapture(str(video_path))
             fps_native = cap.get(cv2.CAP_PROP_FPS) or 30.0
             cap.release()
             max_frames = int(round(args.max_sec * fps_native))
-            res = process_one_video(video_path, track_dir, out_dir, mp_video, mp_image,
-                                     max_frames=max_frames, vitpose=vitpose)
+            res = process_one_video(
+                video_path, track_dir, out_dir, mp_video, mp_image,
+                max_frames=max_frames, vitpose=vitpose,
+                mp_video_short_edge=MP_VIDEO_SHORT_EDGE,
+            )
             mp_video.close()
             if vitpose is not None:
                 # Drop this video's cache to avoid retaining all frames in RAM.

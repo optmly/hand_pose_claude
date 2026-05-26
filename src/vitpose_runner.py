@@ -156,8 +156,8 @@ class ViTPoseRunner:
 
         lm_L = [None] * max_frames
         lm_R = [None] * max_frames
-        cs_L = [0.0] * max_frames
-        cs_R = [0.0] * max_frames
+        sc_L = [None] * max_frames   # per-kp (21,) heatmap-peak scores
+        sc_R = [None] * max_frames
 
         for fi in range(max_frames):
             ok, bgr = cap.read()
@@ -175,26 +175,28 @@ class ViTPoseRunner:
             )
             lm_L[fi] = kpts[LEFT_HAND_IDX].astype(np.float32)
             lm_R[fi] = kpts[RIGHT_HAND_IDX].astype(np.float32)
-            cs_L[fi] = float(scores[LEFT_HAND_IDX].mean())
-            cs_R[fi] = float(scores[RIGHT_HAND_IDX].mean())
+            sc_L[fi] = scores[LEFT_HAND_IDX].astype(np.float32)
+            sc_R[fi] = scores[RIGHT_HAND_IDX].astype(np.float32)
 
         cap.release()
-        result = {"lm_L": lm_L, "lm_R": lm_R, "cs_L": cs_L, "cs_R": cs_R}
+        result = {"lm_L": lm_L, "lm_R": lm_R, "sc_L": sc_L, "sc_R": sc_R}
         self._cache[video_path] = result
         return result
 
-    def get_for_side(self, video_path: Path, frame_idx: int, side: str) -> tuple[np.ndarray | None, float]:
-        """Return (kpts_21x2, mean_score) for the requested side at this frame, or (None, 0.0)."""
+    def get_for_side(self, video_path: Path, frame_idx: int, side: str
+                      ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return (kpts_21x2, per_kp_scores_21) for the requested side at this
+        frame, or (None, None)."""
         if side not in ("left", "right"):
-            return None, 0.0
+            return None, None
         if video_path not in self._cache:
-            return None, 0.0
+            return None, None
         d = self._cache[video_path]
         if frame_idx < 0 or frame_idx >= len(d["lm_L"]):
-            return None, 0.0
+            return None, None
         if side == "left":
-            return d["lm_L"][frame_idx], d["cs_L"][frame_idx]
-        return d["lm_R"][frame_idx], d["cs_R"][frame_idx]
+            return d["lm_L"][frame_idx], d["sc_L"][frame_idx]
+        return d["lm_R"][frame_idx], d["sc_R"][frame_idx]
 
     def unload(self):
         """Free model GPU memory between videos to keep the working set small."""

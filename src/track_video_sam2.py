@@ -122,6 +122,7 @@ WRIST_TRIM_MARGIN_FRAC = -0.06        # shift cut towards the forearm by |this| 
 # Seed verification: reject SAM 3 detections that don't look like hands
 SEED_VERIFY_MIN_SOLIDITY = 0.55       # mask_area / convex_hull_area (hands ~ 0.6-0.85)
 SEED_VERIFY_MAX_ASPECT = 3.5          # bbox long/short ratio (hands rarely > 3:1)
+SEED_VERIFY_CC_AREA_FRAC = 0.20       # consider CCs with area >= this fraction of full mask
 
 # Full-collapse detection: after the tracking pipeline finishes, if obj_0 and
 # obj_1 end up on essentially the same blob (>= 95% IoU on BOTH bbox and mask)
@@ -272,23 +273,55 @@ def seed_is_hand_like(
                         return True, f"mp_landmark_{li}_in_mask"
                 mp_found_hand_outside = True
 
-    # Shape fallback for gloves / occlusions where MP can't anchor inside the mask.
-    ys, xs = np.where(mask)
-    pts = np.column_stack([xs, ys]).astype(np.int32)
-    if len(pts) < 8:
-        return False, "too_few_pts"
-    hull = cv2.convexHull(pts)
-    hull_area = float(cv2.contourArea(hull))
-    mask_area = float(mask.sum())
-    solidity = mask_area / hull_area if hull_area > 0 else 0.0
-    bw = float(bbox[2] - bbox[0])
-    bh = float(bbox[3] - bbox[1])
-    short, long_ = (bw, bh) if bw <= bh else (bh, bw)
-    aspect = long_ / max(short, 1.0)
+    # Shape fallback for gloves / occlusions where MP can't anchor inside the
+    # mask. Evaluate up to the top 3 connected components whose area is at
+    # least SEED_VERIFY_CC_AREA_FRAC of the full mask, score each by its own
+    # (solidity, aspect), and accept if any one is hand-shaped. Picking the
+    # most hand-like CC avoids two failure modes: (a) a noisy mask of stray
+    # pixels around the hand crashes whole-mask solidity (rgb_16: 99% in 1 CC,
+    # 7 stray CCs drop sol 0.86 -> 0.48); (b) when SAM 3 fuses hand + sleeve /
+    # forearm into one box, the largest CC may be the forearm — we want the
+    # CC that actually looks like a hand.
+    m8 = mask.astype(np.uint8)
+    n_cc, lbl, stats, _ = cv2.connectedComponentsWithStats(m8, connectivity=8)
+    if n_cc <= 1:
+        return False, "empty_mask"
+    total_area = float(mask.sum())
+    cc_areas = stats[1:, cv2.CC_STAT_AREA]
+    min_area = SEED_VERIFY_CC_AREA_FRAC * total_area
+    keep = [i + 1 for i, a in enumerate(cc_areas) if a >= min_area]
+    if not keep:
+        return False, "no_substantial_cc"
+    keep.sort(key=lambda i: -int(stats[i, cv2.CC_STAT_AREA]))
+    keep = keep[:3]
+    best_sol = -1.0
+    best_ar = float("inf")
+    for ci in keep:
+        cc_mask = (lbl == ci)
+        ys, xs = np.where(cc_mask)
+        if len(xs) < 8:
+            continue
+        pts = np.column_stack([xs, ys]).astype(np.int32)
+        hull = cv2.convexHull(pts)
+        hull_area = float(cv2.contourArea(hull))
+        cc_area = float(cc_mask.sum())
+        sol = cc_area / hull_area if hull_area > 0 else 0.0
+        cw = float(xs.max() - xs.min())
+        ch = float(ys.max() - ys.min())
+        short, long_ = (cw, ch) if cw <= ch else (ch, cw)
+        ar = long_ / max(short, 1.0)
+        passes = sol >= SEED_VERIFY_MIN_SOLIDITY and ar <= SEED_VERIFY_MAX_ASPECT
+        if passes and (sol > best_sol):
+            best_sol = sol
+            best_ar = ar
+        elif best_sol < 0 and sol > best_sol:
+            # remember best-failing as a fallback for diagnostic message
+            best_sol = sol
+            best_ar = ar
     note = " (mp_hand_was_elsewhere)" if mp_found_hand_outside else ""
-    if solidity >= SEED_VERIFY_MIN_SOLIDITY and aspect <= SEED_VERIFY_MAX_ASPECT:
-        return True, f"shape ok (sol={solidity:.2f}, ar={aspect:.2f}){note}"
-    return False, f"shape rejected (sol={solidity:.2f}, ar={aspect:.2f}){note}"
+    if best_sol >= SEED_VERIFY_MIN_SOLIDITY and best_ar <= SEED_VERIFY_MAX_ASPECT:
+        return True, f"shape ok (sol={best_sol:.2f}, ar={best_ar:.2f}, n_cc={len(keep)}){note}"
+    return False, f"shape rejected (sol={best_sol:.2f}, ar={best_ar:.2f}, n_cc={len(keep)}){note}"
 
 
 def _mp_finds_hand_in_mask(
@@ -410,15 +443,23 @@ def redetect_lost_tracks(
     prompt: str = SAM3_PROMPT,
     score_threshold: float = SAM3_SCORE_THRESHOLD,
     mask_threshold: float = SAM3_MASK_THRESHOLD,
+    sam3_video_path: Path | None = None,
 ) -> dict:
     """Detect lost-track runs, re-seed via SAM 3 at the run-start frame, and
     re-propagate SAM 2 from there. Returns a log dict for the JSON.
+
+    If `sam3_video_path` differs from `video_path`, SAM 3 reads frames from
+    sam3_video_path (typically source resolution); SAM 3 boxes / masks are
+    scaled to the (W, H) of video_path before being fed downstream.
 
     SAM 3 must run OUTSIDE the bfloat16 autocast (it returns BF16 tensors that
     .cpu().numpy() can't materialize). SAM 2 ops (`add_new_mask`,
     `propagate_in_video`) are wrapped in autocast separately.
     """
+    if sam3_video_path is None:
+        sam3_video_path = video_path
     W, H = image_size
+    use_dual = (sam3_video_path != video_path)
     log = {"checked": True, "lost_segments": [], "redetections": []}
     lost_runs = find_lost_track_segments(masks_per_frame, video_path, mp_image, reseed_frames)
     if not lost_runs:
@@ -430,9 +471,10 @@ def redetect_lost_tracks(
             log["lost_segments"].append({"obj_id": int(oid), "start": int(start), "end": int(end)})
     interventions.sort()
 
-    # Pre-read each intervention frame
+    # Pre-read each intervention frame (from BOTH videos when dual-res)
     needed = sorted({s for s, _ in interventions})
-    frame_rgb_at: dict[int, np.ndarray] = {}
+    frame_rgb_at: dict[int, np.ndarray] = {}            # downsampled frames
+    frame_rgb_at_sam3: dict[int, np.ndarray] = {}       # source-res frames
     cap = cv2.VideoCapture(str(video_path))
     fidx = 0
     while True:
@@ -443,17 +485,37 @@ def redetect_lost_tracks(
             frame_rgb_at[fidx] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         fidx += 1
     cap.release()
+    sam3_src_w, sam3_src_h = W, H
+    if use_dual:
+        cap_s = cv2.VideoCapture(str(sam3_video_path))
+        sam3_src_w = int(cap_s.get(cv2.CAP_PROP_FRAME_WIDTH))
+        sam3_src_h = int(cap_s.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fidx = 0
+        while True:
+            ok, bgr = cap_s.read()
+            if not ok:
+                break
+            if fidx in needed:
+                frame_rgb_at_sam3[fidx] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            fidx += 1
+        cap_s.release()
+    else:
+        frame_rgb_at_sam3 = frame_rgb_at
 
     # Stage 1: SAM 3 re-detect (no autocast)
     new_seeds: list[tuple[int, int, np.ndarray]] = []  # (frame, obj_id, trimmed_mask)
     for f, lost_oid in interventions:
         rgb = frame_rgb_at.get(f)
-        if rgb is None:
+        rgb_sam3 = frame_rgb_at_sam3.get(f, rgb)
+        if rgb is None or rgb_sam3 is None:
             continue
         boxes, scores, masks = run_sam3(
-            sam3_proc, sam3_model, Image.fromarray(rgb), device,
+            sam3_proc, sam3_model, Image.fromarray(rgb_sam3), device,
             prompt=prompt, score_threshold=score_threshold, mask_threshold=mask_threshold,
         )
+        if use_dual:
+            boxes, masks = scale_sam3_to(boxes, masks,
+                                          (sam3_src_w, sam3_src_h), (W, H))
         if len(boxes) == 0:
             log["redetections"].append({"frame": int(f), "obj_id": int(lost_oid), "outcome": "sam3_empty"})
             continue
@@ -910,6 +972,42 @@ def trim_mask_at_wrist(
     return out
 
 
+def resize_mask_nn(mask: np.ndarray, dst_h: int, dst_w: int) -> np.ndarray:
+    """Nearest-neighbor resize for a binary mask. No-op when shapes match."""
+    if mask.shape[:2] == (dst_h, dst_w):
+        return mask
+    m_u8 = (mask.astype(np.uint8) * 255)
+    return cv2.resize(m_u8, (dst_w, dst_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+
+def scale_sam3_to(boxes: np.ndarray, masks: np.ndarray,
+                   src_wh: tuple[int, int], dst_wh: tuple[int, int]
+                   ) -> tuple[np.ndarray, np.ndarray]:
+    """Scale SAM 3 boxes (xyxy) and per-instance masks from src_wh to dst_wh.
+
+    No-op when src_wh == dst_wh. Used to convert SAM 3 detections from the
+    source-resolution frames (which SAM 3 sees) into the downsampled
+    coordinate space (where SAM 2 / MP / overlays operate).
+    """
+    if src_wh == dst_wh or len(boxes) == 0:
+        return boxes, masks
+    sw, sh = src_wh
+    dw, dh = dst_wh
+    sx, sy = dw / float(sw), dh / float(sh)
+    scaled_boxes = boxes.copy()
+    scaled_boxes[:, 0] *= sx
+    scaled_boxes[:, 2] *= sx
+    scaled_boxes[:, 1] *= sy
+    scaled_boxes[:, 3] *= sy
+    if masks.shape[1:] == (dh, dw):
+        scaled_masks = masks
+    else:
+        scaled_masks = np.stack(
+            [resize_mask_nn(m, dh, dw) for m in masks], axis=0
+        ) if len(masks) > 0 else np.zeros((0, dh, dw), dtype=bool)
+    return scaled_boxes, scaled_masks
+
+
 @torch.no_grad()
 def run_sam3(
     processor, model, image: Image.Image, device: str,
@@ -1149,19 +1247,27 @@ def overlay_masks(
     return out
 
 
-def truncate_video_to_frames(src: Path, max_frames: int, dst: Path) -> Path:
+def truncate_video_to_frames(src: Path, max_frames: int, dst: Path,
+                              max_short_edge: int | None = None) -> Path:
     """Re-encode the first `max_frames` frames of `src` into `dst` via ffmpeg.
 
-    Keeps the source's FPS / dimensions; uses high-quality libx264 (-crf 18)
-    and strips audio. The caller is responsible for cleaning up `dst`.
+    Uses high-quality libx264 (-crf 18) and strips audio. The caller is
+    responsible for cleaning up `dst`. If `max_short_edge` is set, the video
+    is downsampled so its short edge equals that value (preserving aspect),
+    and the long edge is rounded to an even integer so libx264 accepts it.
     """
-    cmd = [
-        "ffmpeg", "-y", "-v", "error",
-        "-i", str(src),
-        "-frames:v", str(max_frames),
-        "-c:v", "libx264", "-crf", "18", "-an",
-        str(dst),
-    ]
+    vf = None
+    if max_short_edge is not None:
+        # Scale so the short edge equals max_short_edge. Aspect-preserving.
+        # 'iw' / 'ih' are ffmpeg's source-width / -height variables.
+        vf = (f"scale='if(gt(iw,ih),trunc({max_short_edge}*iw/ih/2)*2,"
+              f"{max_short_edge})':'if(gt(iw,ih),{max_short_edge},"
+              f"trunc({max_short_edge}*ih/iw/2)*2)'")
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src)]
+    if vf is not None:
+        cmd += ["-vf", vf]
+    cmd += ["-frames:v", str(max_frames),
+            "-c:v", "libx264", "-crf", "18", "-an", str(dst)]
     subprocess.run(cmd, check=True)
     return dst
 
@@ -1209,16 +1315,35 @@ def _run_tracking_pass(
     prompt: str,
     score_threshold: float = SAM3_SCORE_THRESHOLD,
     mask_threshold: float = SAM3_MASK_THRESHOLD,
+    sam3_video_path: Path | None = None,
 ) -> dict:
     """One full forward+backward+lost-track+collapse-resolve tracking pass
     using `prompt` as the SAM 3 text prompt.
 
+    If `sam3_video_path` is given and differs from `video_path`, SAM 3 reads
+    frames from sam3_video_path (typically source resolution) while SAM 2 +
+    MP + overlays operate on video_path (typically downsampled). SAM 3
+    output boxes / masks are rescaled into the (width, height) coordinate
+    frame of video_path before downstream consumers see them.
+
     Returns a dict with masks_per_frame and all per-pass log structures. The
     SAM 2 inference state is initialized and reset inside this call.
     """
+    if sam3_video_path is None:
+        sam3_video_path = video_path
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"cannot open {video_path}")
+    use_dual = (sam3_video_path != video_path)
+    if use_dual:
+        cap_sam3 = cv2.VideoCapture(str(sam3_video_path))
+        if not cap_sam3.isOpened():
+            raise RuntimeError(f"cannot open sam3 source {sam3_video_path}")
+        sam3_src_w = int(cap_sam3.get(cv2.CAP_PROP_FRAME_WIDTH))
+        sam3_src_h = int(cap_sam3.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    else:
+        cap_sam3 = None
+        sam3_src_w, sam3_src_h = width, height
     pairs = reseed_pair_frames(num_frames, fps, reseed_sec, PAIR_OFFSET_FRAMES)
     flat_seeds = flatten_pairs(pairs)
 
@@ -1231,10 +1356,20 @@ def _run_tracking_pass(
         frame_rgb = extract_frame(cap, sidx)
         if frame_rgb is None:
             continue
+        # SAM 3 input: source-res frame if dual, otherwise same as frame_rgb.
+        if use_dual:
+            frame_rgb_sam3 = extract_frame(cap_sam3, sidx)
+            if frame_rgb_sam3 is None:
+                frame_rgb_sam3 = frame_rgb
+        else:
+            frame_rgb_sam3 = frame_rgb
         boxes, scores, masks = run_sam3(
-            sam3_proc, sam3_model, Image.fromarray(frame_rgb), device,
+            sam3_proc, sam3_model, Image.fromarray(frame_rgb_sam3), device,
             prompt=prompt, score_threshold=score_threshold, mask_threshold=mask_threshold,
         )
+        if use_dual:
+            boxes, masks = scale_sam3_to(boxes, masks,
+                                          (sam3_src_w, sam3_src_h), (width, height))
         if len(boxes) > 0:
             keep_idx = []
             for j in range(len(boxes)):
@@ -1292,6 +1427,8 @@ def _run_tracking_pass(
             "obj_ids": [oid for oid, _, _ in entries],
         })
     cap.release()
+    if cap_sam3 is not None:
+        cap_sam3.release()
 
     if not reseed_data:
         return {
@@ -1390,6 +1527,7 @@ def _run_tracking_pass(
             prompt=prompt,
             score_threshold=score_threshold,
             mask_threshold=mask_threshold,
+            sam3_video_path=sam3_video_path,
         )
 
         sam2_video.reset_state(state)
@@ -1427,6 +1565,7 @@ def track_one_video(
     mp_image: mp_vision.HandLandmarker,
     device: str,
     reseed_sec: float,
+    sam3_video_path: Path | None = None,
 ) -> dict:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1442,6 +1581,7 @@ def track_one_video(
         video_path, sam3_proc, sam3_model, sam2_video, mp_image,
         fps, num_frames, width, height, device, reseed_sec,
         prompt=SAM3_PROMPT,
+        sam3_video_path=sam3_video_path,
     )
 
     # Detect full-screen collapse (both obj_ids on the same blob) and, if
@@ -1462,6 +1602,7 @@ def track_one_video(
             prompt=FALLBACK_SAM3_PROMPT,
             score_threshold=FALLBACK_SAM3_SCORE_THRESHOLD,
             mask_threshold=FALLBACK_SAM3_MASK_THRESHOLD,
+            sam3_video_path=sam3_video_path,
         )
         if fallback["status"] == "no_seeds":
             fallback_collapse = {"triggered": False, "n_collapse_frames": 0, "collapse_frames": []}
@@ -1607,6 +1748,15 @@ def parse_args():
              "(0 or negative disables). SAM 2's frame loader keeps all loaded "
              "frames in RAM, so beyond ~2000 frames (~66s) the process OOMs.",
     )
+    ap.add_argument(
+        "--max-short-edge", type=int, default=None,
+        help="If set, downsample each input video so its short edge equals "
+             "this value (preserves aspect, rounds long edge to even). "
+             "Tracker masks + bboxes are then in the downsampled coordinate "
+             "frame. The downsampled mp4 used as the tracker input is saved "
+             "to <output-dir>/inputs/<stem>.mp4 so downstream stages "
+             "(labeler / pose) can pass that dir as --source-dir.",
+    )
     return ap.parse_args()
 
 
@@ -1633,10 +1783,22 @@ def main():
     print(f"Videos to process: {len(videos)} (order: {'reverse' if args.reverse else 'forward'})")
 
     max_sec = args.max_sec if args.max_sec and args.max_sec > 0 else None
+    max_short_edge = args.max_short_edge if args.max_short_edge and args.max_short_edge > 0 else None
     truncate_tmp_dir: Path | None = None
-    if max_sec is not None:
+    if max_sec is not None or max_short_edge is not None:
         truncate_tmp_dir = Path(tempfile.mkdtemp(prefix="track_truncated_", dir="/tmp"))
-        print(f"Per-video cap: {max_sec:.1f}s (longer videos truncated into {truncate_tmp_dir})")
+        msg_parts = []
+        if max_sec is not None:
+            msg_parts.append(f"cap {max_sec:.1f}s")
+        if max_short_edge is not None:
+            msg_parts.append(f"short-edge {max_short_edge}")
+        print(f"Per-video pre-process: {', '.join(msg_parts)}  ->  {truncate_tmp_dir}")
+    # Persisted dir of downsampled / truncated inputs so downstream stages
+    # (labeler, pose) can use them as --source-dir.
+    inputs_persist_dir = out_dir / "inputs"
+    if max_short_edge is not None:
+        inputs_persist_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Downsampled inputs will be saved to {inputs_persist_dir}")
 
     summary = []
     t0 = time.time()
@@ -1646,9 +1808,14 @@ def main():
                 print(f"  [{i}/{len(videos)}] {vp.name}: MISSING, skip")
                 continue
             tic = time.time()
-            # Pre-truncate any video over the cap into a temp mp4; track_one_video
-            # always sees a clip <= max_sec seconds long.
+            # Pre-process the input mp4 so the tracker sees a clip that is:
+            #   (a) at most max_sec seconds long, and / or
+            #   (b) downsampled so its short edge equals max_short_edge.
+            # When max_short_edge is set we also persist the result into
+            # outputs/track_v<N>/inputs/<stem>.mp4 so labeler / pose can
+            # operate on the matching coordinate frame.
             effective_path = vp
+            need_truncate = False
             if max_sec is not None:
                 cap_probe = cv2.VideoCapture(str(vp))
                 src_fps = cap_probe.get(cv2.CAP_PROP_FPS) or 30.0
@@ -1656,18 +1823,62 @@ def main():
                 cap_probe.release()
                 src_dur = src_nframes / src_fps if src_fps > 0 else 0
                 if src_dur > max_sec:
-                    cap_frames = int(max_sec * src_fps)
-                    truncated = truncate_tmp_dir / vp.name
-                    truncate_video_to_frames(vp, cap_frames, truncated)
-                    effective_path = truncated
-                    print(f"  [{i}/{len(videos)}] {vp.name}: truncated {src_dur:.1f}s -> {max_sec:.1f}s ({cap_frames} frames)")
+                    need_truncate = True
+                else:
+                    # short clip — still need a frame count to pass to ffmpeg
+                    src_fps_keep = src_fps
+                    cap_frames = src_nframes
+            # When --max-short-edge is set we produce TWO mp4s per input:
+            #   source_truncated/<stem>.mp4   truncated only (used by SAM 3
+            #                                  for higher-recall seeding /
+            #                                  redetection)
+            #   <stem>.mp4 (effective_path)   truncated + downsampled (used
+            #                                  by SAM 2 / MP / overlays).
+            # When --max-short-edge is NOT set the two are the same path.
+            sam3_path: Path | None = None
+            if need_truncate or max_short_edge is not None:
+                # Recompute fps / frame count if not done above
+                cap_probe = cv2.VideoCapture(str(vp))
+                src_fps = cap_probe.get(cv2.CAP_PROP_FPS) or 30.0
+                src_nframes = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap_probe.release()
+                cap_frames = (int(max_sec * src_fps)
+                              if (max_sec is not None and need_truncate)
+                              else src_nframes)
+                truncated = truncate_tmp_dir / vp.name
+                truncate_video_to_frames(vp, cap_frames, truncated,
+                                          max_short_edge=max_short_edge)
+                effective_path = truncated
+                desc = []
+                if need_truncate:
+                    desc.append(f"truncated {src_dur:.1f}s -> {max_sec:.1f}s")
+                if max_short_edge is not None:
+                    desc.append(f"short-edge -> {max_short_edge}")
+                # Build the source-resolution truncated mp4 used by SAM 3.
+                if max_short_edge is not None:
+                    sam3_truncated = truncate_tmp_dir / f"src_{vp.name}"
+                    truncate_video_to_frames(vp, cap_frames, sam3_truncated,
+                                              max_short_edge=None)
+                    sam3_path = sam3_truncated
+                    desc.append(f"sam3-src kept at native ({sam3_truncated.name})")
+                print(f"  [{i}/{len(videos)}] {vp.name}: " + ", ".join(desc))
+                if max_short_edge is not None:
+                    # Persist the downsampled input for downstream stages.
+                    persist = inputs_persist_dir / vp.name
+                    shutil.copyfile(truncated, persist)
+                    # Also persist the source-resolution truncated mp4 so the
+                    # labeler / other SAM 3 consumers can stay at native res.
+                    if sam3_path is not None:
+                        persist_src = inputs_persist_dir / f"src_{vp.name}"
+                        shutil.copyfile(sam3_path, persist_src)
             out_video = out_dir / f"{vp.stem}_track.mp4"
             out_meta = out_dir / f"{vp.stem}_track.json"
             out_frames = out_dir / f"{vp.stem}_track.frames.json"
             try:
                 meta = track_one_video(
                     effective_path, out_video, out_meta, out_frames,
-                    sam3_proc, sam3_model, sam2_video, mp_image, args.device, args.reseed_sec
+                    sam3_proc, sam3_model, sam2_video, mp_image, args.device, args.reseed_sec,
+                    sam3_video_path=sam3_path,
                 )
                 # Stamp original-video info on the meta so callers know it was truncated.
                 if effective_path != vp:

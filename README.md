@@ -1,39 +1,39 @@
-# Hand Tracking and Hand Pose Estimation 
+# Hand Tracking and Hand Pose Estimation
 
 Ego-centric hand detection, segmentation, tracking, and pose estimation.
 
-The hand-tracking and L / R labeling stages are considered complete at the
-current release: the tracker + labeler produce stable, consistent per-frame
-hand masks and bboxes (with wearer L / R labels) across the 50-clip
-`/mnt/data/ws/nv-data/full/` dataset truncated to 30 s each. Pose
-estimation continues to build on these outputs.
-
-The pipeline runs in two stages:
+Pipeline stages, in order:
 
 1. **Tracking** ([src/track_video_sam2.py](src/track_video_sam2.py)):
    per-video hand mask tracking. SAM 3 seeds at paired frames every 5 s,
    SAM 2 propagates the masks forward and backward, with identity preserved
    via Hungarian matching, wrist-based mask trimming, seed verification,
-   and a mask-collapse guard. After the pass finishes, a full-screen-collapse
-   detector (both obj_ids on the same blob, bbox + mask IoU >= 0.95) can
-   trigger an automatic retry with the alternate SAM 3 prompt
-   `"egocentric first person's hands"`. A largest-CC mask cleanup removes
-   stray pixels, a seed-frame label-swap fix corrects Hungarian
-   misassignments when the wearer's hands cross between seeds, a mask-spike
-   filter (with collision avoidance against the other obj_id) replaces
-   short-run mask anomalies, and the renderer overlays the frame number
-   on every output frame for easier debugging.
-2. **Pose** ([src/pose_video_mp.py](src/pose_video_mp.py)): MediaPipe
-   HandLandmarker in VIDEO mode, with a hull-area size gate against the
-   tracker masks, a 50%-expanded-square image-mode rerun for failures,
-   and a frame-to-frame consistency filter.
-
-A standalone post-process ([src/label_tracking_handedness.py](src/label_tracking_handedness.py))
-adds L/R wearer-anatomical labels to an existing tracking output. It samples
-frames and queries SAM 3 with the explicit prompts `"wearer left hand"` and
-`"wearer right hand"`; each top detection is matched to the nearest tracker
-obj_id by bbox-centroid distance, and the (Left, Right) pair maximizing the
-joint confidence sum is assigned.
+   and a mask-collapse guard. The seed-verification gate scores the top
+   connected components (>= 20% of the candidate mask, up to 3) and accepts
+   if any one looks hand-like, so multi-piece masks (e.g. arm + hand
+   separated by a wristband, or a clean hand + a few stray pixels) still
+   pass. SAM 3 runs on the source-resolution frame and SAM 2 on a
+   downsampled copy when `--max-short-edge` is set.
+2. **L/R labeling** ([src/label_tracking_handedness.py](src/label_tracking_handedness.py)):
+   samples frames, queries SAM 3 with the explicit prompts `"wearer left
+   hand"` / `"wearer right hand"`, matches each top detection to the
+   nearest tracker obj_id, and picks the (L, R) assignment that maximizes
+   the joint confidence sum. Reads `src_<stem>.mp4` next to `<stem>.mp4`
+   for source-res SAM 3 when present.
+3. **Pose** ([src/pose_video_v2.py](src/pose_video_v2.py)): MediaPipe
+   HandLandmarker in VIDEO mode at a single 1024-short-edge frame, gated
+   against the tracker mask convex hulls (expanded by 20% for the
+   kpts-in-hull check). Two MP image fallbacks on failure: tight
+   mask-zeroed crop, then a 75%-expanded square crop with no zeroing.
+   ViTPose-Huge wholebody (`--vitpose`) is the final backup, used only
+   when MP exhausts and a wearer L/R label is known. Carryforward holds
+   the last accepted pose for up to 10 frames, snapped to the current
+   mask hull centroid + diagonal.
+4. **Smoothing** ([src/kalman_smooth_pose.py](src/kalman_smooth_pose.py)):
+   per-(keypoint, axis) RTS Kalman smoother (42 univariate filters per
+   hand). Carryforward / vitpose frames carry a per-kp confidence that
+   weights measurement noise so the smoother trusts the model more on
+   uncertain frames.
 
 ## Requirements
 
@@ -45,6 +45,12 @@ joint confidence sum is assigned.
 - MediaPipe hand_landmarker.task at one of:
   - `~/.cache/mediapipe/hand_landmarker.task`
   - `models/hand_landmarker.task`
+- ViTPose-Huge wholebody checkpoint (only required when `--vitpose` is
+  passed at pose time):
+
+      ~/.cache/huggingface/hub/models--JunkyByte--easy_ViTPose/snapshots/*/torch/wholebody/vitpose-h-wholebody.pth
+
+  Override with `--vitpose-ckpt /path/to/vitpose-h-wholebody.pth`.
 
 ## Setup
 
@@ -63,67 +69,75 @@ huggingface-cli login
 
 ```bash
 # 1) Track: seeds + SAM 2 propagation for all videos in data/.
-#    Auto-versions to outputs/track_v<N>/.
-python src/track_video_sam2.py
+#    Auto-versions to outputs/track_v<N>/. --max-short-edge persists both
+#    the downsampled and source-resolution truncated mp4s under inputs/.
+python src/track_video_sam2.py \
+    --videos /mnt/data/ws/nv-data/full/rgb_01.mp4 /mnt/data/ws/nv-data/full/rgb_18.mp4 \
+    --max-sec 30 \
+    --max-short-edge 1024
 
-# Optional flags:
-#   --videos data/rgb_01.mp4 data/rgb_18.mp4   # explicit list of inputs
-#   --reverse                                  # process in reverse order
-#   --max-sec 30                               # truncate each video to N seconds
-#                                              # before tracking (default 60).
-#                                              # Set this lower for long clips
-#                                              # to stay under SAM 2's frame-
-#                                              # loader RAM budget.
-python src/track_video_sam2.py --videos data/rgb_01.mp4 data/rgb_18.mp4
-python src/track_video_sam2.py --max-sec 30
+# Process all 50 source clips, 30 s each:
+python src/track_video_sam2.py \
+    --videos /mnt/data/ws/nv-data/full/rgb_*.mp4 \
+    --max-sec 30 \
+    --max-short-edge 1024
 
-# For very long full-length clips a per-video subprocess loop is more reliable
-# than a single python invocation, since SAM 2's frame loader does not evict
-# loaded frames across videos. Example pattern:
-for v in /mnt/data/ws/nv-data/full/rgb_*.mp4; do
-    python src/track_video_sam2.py --videos "$v" --max-sec 30 --output-base outputs
-done
+# 2) Label tracks with wearer L / R. Auto-detects src_<stem>.mp4 in
+#    source-dir for higher-recall SAM 3.
+python src/label_tracking_handedness.py \
+    --track-dir outputs/track_v<N> \
+    --source-dir outputs/track_v<N>/inputs
 
-# 2) Label tracks with L / R wearer-anatomical labels (writes <stem>_track_labeled.mp4).
-#    Pass --source-dir if the source mp4s live somewhere other than data/.
-python src/label_tracking_handedness.py --track-dir outputs/track_v<N>
-python src/label_tracking_handedness.py --track-dir outputs/track_v<N> --source-dir /path/to/source
-
-# 3) Pose estimation: MediaPipe HandLandmarker (VIDEO mode + IMAGE-mode rerun)
-#    gated against the tracker mask convex hulls. Add --vitpose to enable
-#    ViTPose-Huge wholebody as the final backup (covers gloved-hand clips
-#    that MP can't detect). Writes <stem>_pose.{mp4,json} in a fresh
-#    outputs/pose_v<N>/.
+# 3) Pose: MP video + tight MP image rerun + wide MP image rerun, then
+#    ViTPose backup. Writes <stem>_pose.{mp4,json} to outputs/pose_v<N>/.
 python src/pose_video_v2.py \
     --track-dir outputs/track_v<N> \
-    --source-dir /path/to/source \
+    --source-dir outputs/track_v<N>/inputs \
     --num 20 \
-    --max-sec 10 \
+    --max-sec 30 \
     --vitpose
+
+# 4) Kalman smoothing on the pose JSONs. Writes <stem>_pose_smooth.{mp4,json}
+#    to outputs/pose_v<N>_smooth/.
+python src/kalman_smooth_pose.py \
+    --pose-dir outputs/pose_v<N> \
+    --track-dir outputs/track_v<N> \
+    --source-dir outputs/track_v<N>/inputs
 ```
-
-The ViTPose checkpoint is expected at:
-
-    ~/.cache/huggingface/hub/models--JunkyByte--easy_ViTPose/snapshots/*/torch/wholebody/vitpose-h-wholebody.pth
-
-Override with `--vitpose-ckpt /path/to/vitpose-h-wholebody.pth`.
 
 Each tracker run writes, per video:
 
-- `<stem>_track.mp4` -- overlay video (one mask + bbox per obj_id)
-- `<stem>_track.json` -- which prompt + pass was used, full-collapse check,
-  reseed log, pair structure, backward overrides, wrist-trim stats,
-  seed-verification log, mask-collapse resolution, mask-spike filter log
-- `<stem>_track.frames.json` -- per-frame masks (COCO RLE) + bboxes per obj_id
-- `<stem>_track_labeled.mp4` -- post-label overlay video with L/R tags
+- `<stem>_track.mp4` -- overlay video (one mask + bbox per obj_id, with
+  frame numbers)
+- `<stem>_track.json` -- which prompt + pass was used, full-collapse
+  check, reseed log, pair structure, backward overrides, wrist-trim
+  stats, seed-verification log (with per-candidate solidity / aspect),
+  mask-collapse resolution, mask-spike filter log
+- `<stem>_track.frames.json` -- per-frame masks (COCO RLE) + bboxes per
+  obj_id
+- `<stem>_track_labeled.mp4` -- post-label overlay with L / R tags
   (after `label_tracking_handedness.py`)
+- `inputs/<stem>.mp4` -- downsampled truncated input (when
+  `--max-short-edge` is set; downstream coord frame)
+- `inputs/src_<stem>.mp4` -- source-res truncated input (when
+  `--max-short-edge` is set; for SAM 3 consumers)
 
 Each pose run writes:
 
-- `<stem>_pose.mp4` -- overlay with mask, hull polyline, MP skeleton, L/R label
+- `<stem>_pose.mp4` -- overlay with mask, hull polyline, MP / ViTPose
+  skeleton, L / R label, source tag, frame number
 - `<stem>_pose.json` -- per-frame keypoints + flags (`source`,
-  `rejected_reason`, `size_gate`, `mp_score`, `wearer_handedness`)
+  `rejected_reason`, `mp_score`, `kp_confidences`, `wearer_handedness`,
+  `gate_diag`, `wide_gate_diag`, `vitpose_gate_diag`,
+  `vitpose_mean_score`)
+
+Each smoother run writes:
+
+- `<stem>_pose_smooth.mp4` -- overlay with the smoothed skeleton
+- `<stem>_pose_smooth.json` -- per-frame smoothed keypoints + the
+  `had_measurement` flag
 
 ## Version
 
-Current release identifier: [VERSION](VERSION). Full history: [CHANGELOG.md](CHANGELOG.md).
+Current release identifier: [VERSION](VERSION). Full history:
+[CHANGELOG.md](CHANGELOG.md).

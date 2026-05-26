@@ -7,6 +7,78 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0013] - 2026-05-26
+
+### Added
+- Dual-resolution SAM 3 in [src/track_video_sam2.py](src/track_video_sam2.py):
+  feed SAM 3 the source-resolution frame for seeding and lost-track
+  redetection, while SAM 2 / MP / overlays run on a downsampled
+  copy. Wired via `--max-short-edge` (also CLI) and the new
+  `sam3_video_path` plumbing through `_run_tracking_pass`,
+  `redetect_lost_tracks`, `track_one_video`, and `main`. Persists
+  both `inputs/<stem>.mp4` (downsampled, downstream coord frame) and
+  `inputs/src_<stem>.mp4` (source-res, for any subsequent SAM 3
+  consumer).
+- Dual-resolution SAM 3 in [src/label_tracking_handedness.py](src/label_tracking_handedness.py):
+  auto-detects `src_<stem>.mp4` next to `<stem>.mp4` in the source
+  dir and feeds it to SAM 3 while keeping obj_id matching in the
+  downsampled coordinate frame (detection bboxes scaled back).
+- Top-3-CC seed_is_hand_like gate in [src/track_video_sam2.py](src/track_video_sam2.py):
+  for each SAM 3 candidate, evaluate the top 3 connected components
+  whose area is at least `SEED_VERIFY_CC_AREA_FRAC` (=0.20) of the
+  full mask, score each CC's solidity + aspect, and accept if any
+  one is hand-shaped. Handles both noisy multi-CC masks (rgb_16:
+  99% in 1 CC + 7 strays drop sol 0.86 -> 0.48) and SAM 3 fusing
+  arm + hand into one box separated by a wristband.
+- Wide-crop MP image fallback in [src/pose_video_v2.py](src/pose_video_v2.py):
+  after the existing tight + mask-zeroed `run_mp_image_masked` step
+  fails, `run_mp_image_wide` retries on a square crop expanded by
+  `MP_WIDE_CROP_EXPAND_FRAC` (=0.75) of the mask bbox without
+  background zeroing. Gives MP enough surrounding context for
+  closed-fist / dorsal-view / small-mask cases where the tight
+  zeroed crop has no recognizable hand structure. New source label
+  `mp_image_rerun_wide` and corresponding `wide_gate_fail` /
+  `wide_no_detection` reason chains.
+- 20% expanded convex-hull check in
+  [src/pose_video_v2.py](src/pose_video_v2.py):
+  `gate_kpts_in_hull` now scales the mask convex hull about its
+  centroid by `1 + KPTS_HULL_EXPAND_FRAC` (=0.20) before the
+  point-in-polygon test, letting MP video detections whose
+  fingertips extend a few px past the SAM-mask hull pass without
+  having to loosen the 50%-in-hull threshold itself.
+- Snap-to-mask carryforward in
+  [src/pose_video_v2.py](src/pose_video_v2.py): when a frame falls
+  through to carryforward, the held pose is translated so its
+  centroid aligns with the current mask hull centroid and scaled so
+  its bbox diagonal matches the hull diagonal. Keeps the rendered
+  skeleton visually anchored to the actual hand instead of drawing
+  at the stale frame's coordinates.
+- Per-keypoint Kalman smoother [src/kalman_smooth_pose.py](src/kalman_smooth_pose.py):
+  RTS (Rauch-Tung-Striebel) constant-velocity smoother run
+  independently per (keypoint, axis) -- 42 univariate filters per
+  hand. Optional per-frame keypoint confidence weights the
+  measurement noise (`R_t = (sigma_m / max(conf, conf_floor))^2`),
+  so carryforward / low-confidence frames get smoothed over more
+  aggressively. Writes `<stem>_pose_smooth.{mp4,json}` to a fresh
+  `outputs/pose_v<N>_smooth/`.
+
+### Fixed
+- Temporal-jump prev_pose reset in
+  [src/pose_video_v2.py](src/pose_video_v2.py): when a fresh MP
+  detection fails the temporal-jump gate AND the carryforward window
+  is exhausted, also reset `prev_pose[oid] = None` (matching the
+  no-detection branch). Without this, prev_pose stayed pinned to a
+  many-frames-old pose forever and every subsequent MP-video
+  detection was rejected as a jump against that stale anchor. On
+  rgb_02 this single fix collapsed missing from 85 -> 4 frames
+  (+76 accepted, +12.7 pp).
+
+### Result (rgb_02 alone, 10 s @ 1024p, 598 effective hand-slots)
+- baseline 0012: accepted 488 (81.6%), missing 85 (14.2%), of which
+  temporal_jump=74.
+- 0013: accepted 564 (94.3%), missing 4 (0.7%); only 9 temporal-jump
+  rejections survive (median 279 px, all real moderate jumps).
+
 ## [0012] - 2026-05-24
 
 ### Added
