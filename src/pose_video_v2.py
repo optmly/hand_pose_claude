@@ -80,7 +80,16 @@ KPTS_HULL_EXPAND_FRAC = 0.20
 # ACTUAL tracker mask (not the convex hull). Catches candidates that
 # geometrically fall inside the hull but are on a different subject (e.g.,
 # coworker hand near the wearer's mask region). 0.0 disables the check.
-MASK_KPTS_MIN_FRAC = 0.0
+MASK_KPTS_MIN_FRAC = 0.50
+# Skip-pose rule for small partial hand masks at the screen edge: when
+# the tracker mask area is below SMALL_EDGE_MASK_AREA_FRAC of the
+# screen AND the mask touches a frame border, the hand is only partly
+# in view and any pose estimate would be unreliable. We don't record
+# or display a pose for those frames (entry keypoints stays None,
+# reason = "small_edge_mask"); the Kalman smoother also NaN's out
+# the smoothed pose at those frames so the rendered video doesn't
+# extrapolate across an unreliable region.
+SMALL_EDGE_MASK_AREA_FRAC = 0.005
 # Size sanity: a candidate pose whose bbox area exceeds this multiple of
 # the mask bbox area is treated as a hallucination.
 POSE_BBOX_MAX_RATIO = 2.5
@@ -197,6 +206,20 @@ def largest_cc_hull(mask: np.ndarray) -> tuple[np.ndarray | None, float, np.ndar
     diag = float(np.hypot(hpts[:, 0].max() - hpts[:, 0].min(),
                           hpts[:, 1].max() - hpts[:, 1].min()))
     return hull, diag, comp.astype(bool)
+
+
+def is_small_edge_mask(mask: np.ndarray, area_frac: float = SMALL_EDGE_MASK_AREA_FRAC) -> bool:
+    """True iff the mask is small (area < area_frac * screen area) AND
+    touches one of the frame's borders. Used to skip pose estimation on
+    partial hand fragments that enter/exit the camera view."""
+    if mask is None or mask.sum() == 0:
+        return False
+    H, W = mask.shape[:2]
+    if int(mask.sum()) >= area_frac * W * H:
+        return False
+    if mask[0, :].any() or mask[H - 1, :].any() or mask[:, 0].any() or mask[:, W - 1].any():
+        return True
+    return False
 
 
 def hull_area(pts) -> float:
@@ -804,6 +827,14 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                 entry["rejected_reason"] = "mask_too_small_or_missing"
                 # Reset prev_pose age too — but allow short carry-forward if we
                 # had a recent accepted pose
+                frame_record["hands"].append(entry)
+                continue
+            if is_small_edge_mask(masks[oid]):
+                # Small partial hand mask at the screen edge: hand is
+                # entering / exiting the camera view; pose would be
+                # unreliable. Skip detection AND mark for the Kalman
+                # smoother to NaN out the smoothed pose at this frame.
+                entry["rejected_reason"] = "small_edge_mask"
                 frame_record["hands"].append(entry)
                 continue
 

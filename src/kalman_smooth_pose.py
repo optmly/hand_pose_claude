@@ -53,6 +53,10 @@ LABEL_TEXT_COLOR = (0, 255, 255)
 # smoother's interpolation is unreliable -- mark those frames as missing
 # instead of rendering an extrapolated pose.
 SKIP_MAX_GAP_FRAMES = 5             # gap LARGER than this triggers the motion check
+# Post-smooth mask-containment threshold: smoothed/interpolated poses
+# whose kpts fall less than this fraction inside the actual tracker
+# mask are NaN'd out (the pose has drifted off the wearer hand).
+MIN_KPTS_IN_MASK_FRAC = 0.50
 SKIP_MAX_MASK_MOTION_FRAC = 0.05    # mask centroid move > this * image diag -> skip
 HAND_CONNECTIONS = (
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -348,8 +352,13 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
         return {"video": stem, "error": "tracker frames.json missing"}
     track_frames = json.loads(track_frames_json.read_text())
 
-    # Per-frame mask centroids per obj, used by the gap-skip rule.
+    # Per-frame mask centroids + raw masks per obj. Centroids feed the
+    # gap-skip rule; raw masks feed the post-smooth mask-containment
+    # check (smoothed kpts must be >= MIN_KPTS_IN_MASK_FRAC inside the
+    # actual mask, else NaN'd out).
     mask_centroids: dict[int, list[tuple[float, float] | None]] = {
+        0: [None] * n_frames, 1: [None] * n_frames}
+    mask_arrays: dict[int, list[np.ndarray | None]] = {
         0: [None] * n_frames, 1: [None] * n_frames}
     for fi, fr in enumerate(track_frames["frames"]):
         if fi >= n_frames:
@@ -365,6 +374,20 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
                 continue
             ys, xs = np.where(m)
             mask_centroids[oid][fi] = (float(xs.mean()), float(ys.mean()))
+            mask_arrays[oid][fi] = m
+
+    # Per-frame "small_edge_mask" flag from the pose stage. These frames
+    # had the partial-hand skip; we NaN out the smoother output too so
+    # it doesn't extrapolate across an unreliable region.
+    small_edge: dict[int, list[bool]] = {
+        0: [False] * n_frames, 1: [False] * n_frames}
+    for fi, fr in enumerate(pose["frames"]):
+        if fi >= n_frames:
+            break
+        for h in fr["hands"]:
+            oid = int(h["obj_id"])
+            if oid in small_edge and h.get("rejected_reason") == "small_edge_mask":
+                small_edge[oid][fi] = True
 
     # Gap-skip: when the smoother has interpolated across a long no-detection
     # gap during which the hand moved a lot, NaN out the smoothed pose for
@@ -377,7 +400,38 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
         )
         if skip.any():
             smoothed_seq[oid][skip] = np.nan
-        skip_stats[oid] = {"skipped_frames": int(skip.sum())}
+        # Small-edge-mask frames: NaN out (pose stage already skipped
+        # detection; we suppress smoother extrapolation too).
+        for fi, is_se in enumerate(small_edge[oid]):
+            if is_se:
+                smoothed_seq[oid][fi] = np.nan
+        # Mask-containment: smoothed pose must have at least
+        # MIN_KPTS_IN_MASK_FRAC of keypoints inside the actual mask.
+        # If not, NaN out the smoothed pose for that frame (the pose
+        # has drifted too far outside the wearer hand).
+        mask_skip_count = 0
+        for fi in range(n_frames):
+            pts = smoothed_seq[oid][fi]
+            if np.isnan(pts).any():
+                continue
+            m = mask_arrays[oid][fi]
+            if m is None:
+                continue
+            Hm, Wm = m.shape[:2]
+            inside = 0
+            for (x, y) in pts:
+                xi = int(round(float(x))); yi = int(round(float(y)))
+                if 0 <= xi < Wm and 0 <= yi < Hm and bool(m[yi, xi]):
+                    inside += 1
+            frac = inside / max(len(pts), 1)
+            if frac < MIN_KPTS_IN_MASK_FRAC:
+                smoothed_seq[oid][fi] = np.nan
+                mask_skip_count += 1
+        skip_stats[oid] = {
+            "skipped_frames": int(skip.sum()),
+            "small_edge_frames": int(sum(small_edge[oid])),
+            "mask_containment_skipped": mask_skip_count,
+        }
 
     out_mp4 = out_dir / f"{stem}_pose_smooth.mp4"
     out_mp4_clean = out_dir / f"{stem}_pose_smooth_clean.mp4"

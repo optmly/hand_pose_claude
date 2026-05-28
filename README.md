@@ -26,11 +26,17 @@ Pipeline stages, in order:
    maximizes the joint confidence sum. Reads `src_<stem>.mp4` next to
    `<stem>.mp4` for source-res SAM 3 when present.
 3. **Pose** ([src/pose_video_v2.py](src/pose_video_v2.py)): five-stage
-   cascade per (frame, obj_id):
+   cascade per (frame, obj_id). Per-frame pre-check: if the mask is
+   missing / below `MIN_MASK_AREA_PX`, skip with reason
+   `mask_too_small_or_missing`. If the mask is small
+   (area < 0.5% of screen) AND touches a frame border, skip with
+   reason `small_edge_mask` (partial hand entering/exiting view).
+   Otherwise run:
    1. **MP video VIDEO mode** at 1024 short-edge, gated by hull
       checks (wrist near 20%-expanded hull, ≥50% kpts inside hull,
-      pose-hull / mask-hull area ∈ [0.30, 2.5]). If the area ratio
-      is < 0.45 (`MP_VIDEO_MIN_AREA_RATIO`) the VIDEO-tracked pose is
+      ≥50% kpts inside the actual mask, pose-hull / mask-hull area
+      ∈ [0.30, 2.5]). If the area ratio is < 0.45
+      (`MP_VIDEO_MIN_AREA_RATIO`) the VIDEO-tracked pose is
       considered compressed (tucked fingers held over from prior
       frame) and the cascade falls through.
    2. **MP video IMAGE mode** (no tracking) on the same frame; same
@@ -40,8 +46,8 @@ Pipeline stages, in order:
       zeroing. Gives MP enough context for closed-fist / dorsal-view
       cases.
    5. **ViTPose-Huge wholebody** (`--vitpose`) for the matching L/R
-      side, gated against the same hull checks.
-   Every detector candidate must pass both the hull gates AND
+      side, gated against the same hull and mask checks.
+   Every detector candidate must pass all hull/mask gates AND
    `gate_temporal_jump` (`base × √(1 + prev_age)`); first to pass
    wins. Carryforward (≤10 frames) snaps the held pose to the current
    mask hull centroid + diagonal. After the loop, a post-pass
@@ -52,10 +58,13 @@ Pipeline stages, in order:
    per-(keypoint, axis) RTS Kalman smoother (42 univariate filters per
    hand). Carryforward / vitpose frames carry a per-kp confidence that
    weights measurement noise so the smoother trusts the model more on
-   uncertain frames. Gaps > 5 frames where the mask centroid moved
-   > 5% of image diagonal are NaN'd out (the smoother's interpolation
-   across unreliable stretches is removed). Writes two videos per
-   source: `<stem>_pose_smooth.mp4` (full overlay) and
+   uncertain frames. Post-smooth, three conditions NaN out the
+   smoothed pose so the rendered overlay and JSON show no pose:
+   (a) gaps > 5 frames where the mask centroid moved > 5% of image
+   diagonal, (b) frames the pose stage flagged `small_edge_mask`,
+   (c) frames where the smoothed kpts fall < 50% inside the actual
+   tracker mask. Writes two videos per source:
+   `<stem>_pose_smooth.mp4` (full overlay) and
    `<stem>_pose_smooth_clean.mp4` (no hull, lighter mask α=0.20).
 
 ## Requirements

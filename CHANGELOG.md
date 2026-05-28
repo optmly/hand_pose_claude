@@ -7,6 +7,41 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0015] - 2026-05-28
+
+### Added
+- Small-edge-mask skip in
+  [src/pose_video_v2.py](src/pose_video_v2.py): when the tracker mask
+  is small (area < `SMALL_EDGE_MASK_AREA_FRAC` = 0.005 of the screen)
+  AND touches any frame border, the frame is partial hand-in-view and
+  pose estimation is skipped (`rejected_reason = "small_edge_mask"`,
+  `keypoints = None`). New helper `is_small_edge_mask`.
+- `gate_kpts_in_mask` enabled by default with
+  `MASK_KPTS_MIN_FRAC = 0.50`: candidates (from any detector path)
+  must have >= 50% of keypoints lying inside the actual tracker mask
+  (not just the convex hull). Catches coworker-hand or otherwise
+  outside-mask poses that geometrically fall inside the hull but
+  don't overlap the wearer-mask pixels.
+- Kalman post-smooth mask-containment NaN in
+  [src/kalman_smooth_pose.py](src/kalman_smooth_pose.py)
+  (`MIN_KPTS_IN_MASK_FRAC` = 0.50): after smoothing, any frame whose
+  smoothed/interpolated keypoints fall less than 50% inside the
+  actual tracker mask is NaN'd out so the rendered overlay and JSON
+  show no pose for that frame.
+- Kalman small_edge propagation: frames flagged
+  `small_edge_mask` at the pose stage are also NaN'd out in the
+  smoother so the rendered video doesn't extrapolate across them.
+
+### Result (50 videos × 30 s, release_50_v3 re-run)
+- Pose: 67,097 / 69,594 accepted (96.41%); 576 missing (0.83%);
+  255 new `small_edge_mask` frames; 1,921 carryforward.
+- Source mix: mp_video 84.6%, vitpose 5.9%, interpolated 3.6%,
+  mp_image_rerun 2.6%, mp_video_image 2.1%, mp_image_rerun_wide
+  1.1%.
+- Kalman smoothed mp4s now show no pose on 2,081 frames where the
+  pose either was a small-edge skip, hit the post-smooth
+  mask-containment threshold, or fell in a gap-skip interval.
+
 ## [0014] - 2026-05-28
 
 ### Added
