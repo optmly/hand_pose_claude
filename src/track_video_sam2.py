@@ -1157,57 +1157,135 @@ def encode_mask_rle(mask: np.ndarray) -> dict:
 
 
 def mask_bbox(mask: np.ndarray) -> list[float] | None:
-    """Bounding box of the LARGEST connected component of `mask`.
-
-    Using the largest CC instead of all mask pixels prevents stray pixels far
-    from the main hand blob from inflating the bbox (rgb_34 had random bbox
-    jumps to ~2x size because SAM 2 occasionally emits tiny disconnected blobs).
+    """Bounding box covering the largest CC plus any substantial proximal CC
+    (same rule as `keep_substantial_proximal_ccs`). Tiny strays far from the
+    main hand blob are still excluded; fingers that got separated from the
+    palm by a tool / utensil are now included.
     """
-    if mask.sum() == 0:
+    if mask is None or mask.sum() == 0:
         return None
     m_u8 = mask.astype(np.uint8)
     num, _, stats, _ = cv2.connectedComponentsWithStats(m_u8, connectivity=8)
-    if num <= 1:
+    if num <= 2:
         ys, xs = np.where(mask)
         return [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
-    biggest = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
-    x, y, w, h, _ = stats[biggest]
-    return [float(x), float(y), float(x + w - 1), float(y + h - 1)]
+    cc_areas = stats[1:, cv2.CC_STAT_AREA]
+    total_area = int(cc_areas.sum())
+    biggest = int(np.argmax(cc_areas)) + 1
+    lx, ly, lw, lh = stats[biggest, cv2.CC_STAT_LEFT], stats[biggest, cv2.CC_STAT_TOP], \
+                      stats[biggest, cv2.CC_STAT_WIDTH], stats[biggest, cv2.CC_STAT_HEIGHT]
+    l_diag = float(np.hypot(lw, lh))
+    gap_thresh = CC_KEEP_MAX_GAP_FRAC * l_diag
+    # Start with the largest CC's bbox
+    x1, y1, x2, y2 = lx, ly, lx + lw - 1, ly + lh - 1
+    for i in range(1, num):
+        if i == biggest:
+            continue
+        if cc_areas[i - 1] < CC_KEEP_MIN_AREA_FRAC * total_area:
+            continue
+        ix, iy = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]
+        iw, ih = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+        dx = max(0, max(lx - (ix + iw), ix - (lx + lw)))
+        dy = max(0, max(ly - (iy + ih), iy - (ly + lh)))
+        if float(np.hypot(dx, dy)) > gap_thresh:
+            continue
+        x1 = min(x1, ix); y1 = min(y1, iy)
+        x2 = max(x2, ix + iw - 1); y2 = max(y2, iy + ih - 1)
+    return [float(x1), float(y1), float(x2), float(y2)]
 
 
-def keep_largest_cc(mask: np.ndarray) -> np.ndarray:
-    """Return a new mask containing only the largest connected component.
+CC_KEEP_MIN_AREA_FRAC = 0.05      # min area as a fraction of the total mask
+CC_KEEP_MAX_GAP_FRAC = 0.10       # max gap to the largest CC as a fraction of its bbox diagonal
 
-    SAM 2 occasionally emits tiny stray CCs far from the main hand blob
-    (e.g., a single-pixel remnant of a SAM 3 seed that was supposed to be
-    replaced). Those strays don't affect mask area materially but stretch
-    the rendered bbox to enclose them (the renderer uses np.where over all
-    mask pixels). Cleaning to the largest CC keeps mask/bbox/centroid
-    derivations all consistent.
+
+def keep_substantial_proximal_ccs(mask: np.ndarray,
+                                    min_area_frac: float = CC_KEEP_MIN_AREA_FRAC,
+                                    max_gap_frac: float = CC_KEEP_MAX_GAP_FRAC,
+                                    ) -> np.ndarray:
+    """Return a mask containing the largest CC plus any other CC that is
+    both substantial (area >= min_area_frac * total mask area) AND proximal
+    to the largest CC (bbox-to-bbox gap <= max_gap_frac * largest CC diagonal).
+
+    Replaces the previous keep_largest_cc behavior, which was too aggressive
+    for hands holding a tool: when a knife / spatula visually splits the
+    hand, the fingers become a separate CC right next to the palm CC.
+    With keep_largest_cc that fingers CC was discarded; this function keeps
+    it as long as it is substantial and spatially adjacent. Tiny stray CCs
+    far from the hand (single-pixel SAM 3 seed remnants etc.) are still
+    dropped via the area threshold.
     """
     if mask is None or mask.sum() == 0:
         return mask
     m_u8 = mask.astype(np.uint8)
     num, labels, stats, _ = cv2.connectedComponentsWithStats(m_u8, connectivity=8)
     if num <= 2:
-        return mask  # single CC (num=2 = background + one CC), nothing to drop
+        return mask  # single CC, nothing to drop
+    cc_areas = stats[1:, cv2.CC_STAT_AREA]
+    total_area = int(cc_areas.sum())
+    biggest_idx = int(np.argmax(cc_areas)) + 1
+    # Largest CC bbox
+    lx = stats[biggest_idx, cv2.CC_STAT_LEFT]
+    ly = stats[biggest_idx, cv2.CC_STAT_TOP]
+    lw = stats[biggest_idx, cv2.CC_STAT_WIDTH]
+    lh = stats[biggest_idx, cv2.CC_STAT_HEIGHT]
+    l_diag = float(np.hypot(lw, lh))
+    gap_thresh = max_gap_frac * l_diag
+    keep = (labels == biggest_idx)
+    for i in range(1, num):
+        if i == biggest_idx:
+            continue
+        if cc_areas[i - 1] < min_area_frac * total_area:
+            continue
+        ix = stats[i, cv2.CC_STAT_LEFT]
+        iy = stats[i, cv2.CC_STAT_TOP]
+        iw = stats[i, cv2.CC_STAT_WIDTH]
+        ih = stats[i, cv2.CC_STAT_HEIGHT]
+        # L2 distance between the two bboxes (zero if they overlap or touch)
+        dx = max(0, max(lx - (ix + iw), ix - (lx + lw)))
+        dy = max(0, max(ly - (iy + ih), iy - (ly + lh)))
+        gap = float(np.hypot(dx, dy))
+        if gap <= gap_thresh:
+            keep |= (labels == i)
+    return keep
+
+
+def keep_largest_cc(mask: np.ndarray) -> np.ndarray:
+    """Backwards-compatible alias used by call sites that strictly need a
+    single-CC mask (e.g., bbox / centroid computation where multiple CCs
+    would distort the result). Prefer `keep_substantial_proximal_ccs` for
+    the full-mask cleanup pass.
+    """
+    if mask is None or mask.sum() == 0:
+        return mask
+    m_u8 = mask.astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m_u8, connectivity=8)
+    if num <= 2:
+        return mask
     biggest = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
     return (labels == biggest)
 
 
 def cleanup_masks_largest_cc(masks_per_frame: dict[int, dict[int, np.ndarray]]) -> dict:
-    """Replace every mask in masks_per_frame with its largest connected
-    component. Returns a small log with how many frames / masks were cleaned."""
+    """Replace every mask with its largest CC plus any substantial proximal
+    CC (see `keep_substantial_proximal_ccs`). Returns a small log with how
+    many masks were changed."""
     cleaned = 0
+    multi_cc_kept = 0
     for fidx, per_obj in masks_per_frame.items():
         for oid, m in list(per_obj.items()):
             if m is None or m.sum() == 0:
                 continue
-            new_m = keep_largest_cc(m)
+            new_m = keep_substantial_proximal_ccs(m)
             if new_m is not m and int(new_m.sum()) != int(m.sum()):
                 per_obj[oid] = new_m
                 cleaned += 1
-    return {"masks_cleaned": cleaned}
+            elif new_m is m:
+                # already a single CC, no change
+                pass
+            else:
+                # multi-CC kept intact (proximal substantial CC retained)
+                multi_cc_kept += 1
+    return {"masks_cleaned": cleaned, "multi_cc_masks_kept": multi_cc_kept}
 
 
 def overlay_masks(
@@ -1741,6 +1819,9 @@ def parse_args():
     ap.add_argument("--reseed-sec", type=float, default=RESEED_INTERVAL_SEC)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--output-base", default="outputs", help="Parent dir; subfolder track_v<N> auto-versioned.")
+    ap.add_argument("--output-dir", default=None,
+                     help="Fixed output dir (bypasses --output-base auto-versioning). "
+                          "Useful for per-video subprocess loops that all write to one dir.")
     ap.add_argument("--reverse", action="store_true", help="Process videos in reverse order.")
     ap.add_argument(
         "--max-sec", type=float, default=MAX_TRACK_SEC_DEFAULT,
@@ -1763,7 +1844,13 @@ def parse_args():
 def main():
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
-    out_dir = pick_next_version_dir(root / args.output_base)
+    if args.output_dir is not None:
+        out_dir = Path(args.output_dir)
+        if not out_dir.is_absolute():
+            out_dir = root / out_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = pick_next_version_dir(root / args.output_base)
     print(f"Output dir: {out_dir}")
 
     print(f"Loading {SAM3_MODEL_ID} + {SAM2_VIDEO_MODEL_ID} + MediaPipe HandLandmarker on {args.device} ...")

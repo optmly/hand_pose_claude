@@ -76,9 +76,36 @@ MIN_KPTS_IN_HULL_FRAC = 0.50
 # hull on otherwise-correct MP detections; a slight outward dilation lets
 # those poses through without loosening the threshold itself.
 KPTS_HULL_EXPAND_FRAC = 0.20
+# Additional gate: minimum fraction of keypoints that must lie inside the
+# ACTUAL tracker mask (not the convex hull). Catches candidates that
+# geometrically fall inside the hull but are on a different subject (e.g.,
+# coworker hand near the wearer's mask region). 0.0 disables the check.
+MASK_KPTS_MIN_FRAC = 0.0
 # Size sanity: a candidate pose whose bbox area exceeds this multiple of
 # the mask bbox area is treated as a hallucination.
 POSE_BBOX_MAX_RATIO = 2.5
+# Minimum acceptable pose-bbox / mask-bbox area ratio. Catches both
+# degenerate MP image-rerun detections that collapse all 21 kpts to a tiny
+# cluster (~20 px diag in a ~180 px mask, ratio ~0.012) AND MP-video
+# tracked-in detections that come back compressed when the underlying hand
+# is much larger (rgb_03 f183 obj1: pose 90 px in 185 px mask, ratio 0.23).
+# 99.3% of legitimate accepted poses across 20 videos have ratio >= 0.30;
+# mp_video's 5th percentile is 0.47, vitpose is 0.42. 0.30 catches the
+# compressed cases without touching the bulk of legitimate detections.
+POSE_BBOX_MIN_RATIO = 0.30
+# MP-video size gates (using pose-keypoints convex-hull area / mask
+# convex-hull area). VIDEO mode tracking can lock onto a tucked-finger
+# pose from prior frames; if the resulting hull-area ratio is below the
+# threshold, fall through to MP video IMAGE mode (no tracking). IMAGE
+# mode applies the same threshold; below it falls through to the rest
+# of the cascade (mp_image_rerun, wide, vitpose) which use the lower
+# POSE_BBOX_MIN_RATIO floor.
+# After the cascade, runs of compressed-MP-video frames that are
+# <= COMPRESSED_INTERP_MAX_LEN AND bracketed by uncompressed mp_video
+# accepts are linearly interpolated, overriding the cascade output.
+MP_VIDEO_MIN_AREA_RATIO = 0.45
+MP_VIDEO_IMAGE_MIN_AREA_RATIO = 0.45
+COMPRESSED_INTERP_MAX_LEN = 7
 # Temporal jump cap (fraction of image diagonal) for per-kp mean
 # displacement vs the most recently accepted pose for the same obj_id.
 CONSISTENCY_MAX_PX_FRAC = 0.10
@@ -170,6 +197,24 @@ def largest_cc_hull(mask: np.ndarray) -> tuple[np.ndarray | None, float, np.ndar
     diag = float(np.hypot(hpts[:, 0].max() - hpts[:, 0].min(),
                           hpts[:, 1].max() - hpts[:, 1].min()))
     return hull, diag, comp.astype(bool)
+
+
+def hull_area(pts) -> float:
+    """Convex hull area of a 2D point set (e.g., 21 hand keypoints).
+    Returns 0.0 if fewer than 3 points or all collinear."""
+    a = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    if len(a) < 3:
+        return 0.0
+    h = cv2.convexHull(a)
+    return float(cv2.contourArea(h))
+
+
+def mask_hull_area(hull) -> float:
+    """Convex hull area of the mask hull (already computed by
+    `largest_cc_hull`)."""
+    if hull is None:
+        return 0.0
+    return float(cv2.contourArea(hull.astype(np.int32)))
 
 
 def bbox_area(bbox) -> float:
@@ -290,28 +335,68 @@ def gate_kpts_in_hull(kpts: np.ndarray, hull: np.ndarray) -> tuple[bool, float]:
     return (frac >= MIN_KPTS_IN_HULL_FRAC), frac
 
 
-def gate_size_sanity(kpts: np.ndarray, mask_bbox) -> tuple[bool, float]:
-    """Pose bbox area must not exceed POSE_BBOX_MAX_RATIO * mask_bbox area."""
-    if mask_bbox is None:
-        return False, 0.0
-    pose_area = bbox_area(kp_bbox(kpts))
-    mask_a = bbox_area(mask_bbox)
+def gate_size_sanity(kpts: np.ndarray, mask_hull) -> tuple[bool, float]:
+    """Pose-keypoints convex-hull area must be within
+    [POSE_BBOX_MIN_RATIO, POSE_BBOX_MAX_RATIO] * mask convex-hull area.
+    The upper bound rejects poses that span far beyond the hand mask
+    (wrong subject); the lower bound rejects degenerate MP image
+    detections that collapse all 21 kpts into a tiny cluster.
+
+    Uses convex hulls (not bounding boxes) so the ratio reflects actual
+    spatial extent, not axis-aligned bbox area which is biased by hand
+    orientation."""
+    mask_a = mask_hull_area(mask_hull)
     if mask_a <= 0:
         return False, 0.0
-    ratio = pose_area / mask_a
-    return (ratio <= POSE_BBOX_MAX_RATIO), ratio
+    pose_a = hull_area(kpts)
+    ratio = pose_a / mask_a
+    return (POSE_BBOX_MIN_RATIO <= ratio <= POSE_BBOX_MAX_RATIO), ratio
 
 
 def gate_temporal_jump(kpts: np.ndarray, prev_kpts: np.ndarray | None,
-                       image_diag: float) -> tuple[bool, float]:
-    """Mean per-kp displacement vs prev_kpts must be <= CONSISTENCY_MAX_PX_FRAC * image_diag."""
+                       image_diag: float, prev_age: int = 0
+                       ) -> tuple[bool, float]:
+    """Mean per-kp displacement vs prev_kpts must be within a gap-scaled
+    threshold. Base threshold is CONSISTENCY_MAX_PX_FRAC * image_diag per
+    adjacent frame; for an older prev_pose (separated by `prev_age` failed
+    or skipped frames), scale by sqrt(1 + prev_age) under a random-walk
+    motion model. With prev_age=0 this matches the original adjacent-frame
+    bound; with prev_age=10 the bound is ~3.3x larger, accommodating real
+    hand motion across short stretches where MP/MP-image/ViTPose all
+    failed to produce a fresh detection."""
     if prev_kpts is None:
         return True, 0.0
     jump = float(np.linalg.norm(kpts - prev_kpts, axis=1).mean())
-    return (jump <= CONSISTENCY_MAX_PX_FRAC * image_diag), jump
+    base = CONSISTENCY_MAX_PX_FRAC * image_diag
+    thresh = base * (1.0 + max(prev_age, 0)) ** 0.5
+    return (jump <= thresh), jump
 
 
 # ──────────────────────── MP wrappers ────────────────────────
+
+def run_mp_video_frame_image(landmarker, frame_rgb: np.ndarray,
+                              out_W: int | None = None, out_H: int | None = None
+                              ) -> list[dict]:
+    """Same as `run_mp_video_frame` but uses `detect()` (IMAGE mode, no
+    tracking). First backup when VIDEO-mode tracking returns a too-
+    compressed pose; without the tracking bias IMAGE mode often produces
+    a fuller pose."""
+    img = mp.Image(image_format=mp.ImageFormat.SRGB,
+                   data=np.ascontiguousarray(frame_rgb))
+    res = landmarker.detect(img)
+    H, W = frame_rgb.shape[:2]
+    target_w = out_W if out_W is not None else W
+    target_h = out_H if out_H is not None else H
+    out = []
+    for i, lms in enumerate(res.hand_landmarks):
+        pts = mp_pts_to_image(lms, target_w, target_h)
+        score = float(res.handedness[i][0].score) if (res.handedness and i < len(res.handedness)) else 0.0
+        handed = res.handedness[i][0].category_name if (res.handedness and i < len(res.handedness)) else None
+        kp_conf = np.full(21, score, dtype=np.float32)
+        out.append({"keypoints": pts, "score": score, "handedness": handed,
+                     "kp_confidences": kp_conf})
+    return out
+
 
 def run_mp_video_frame(landmarker, frame_rgb: np.ndarray, ts_ms: int,
                         out_W: int | None = None, out_H: int | None = None
@@ -445,10 +530,31 @@ def run_mp_image_wide(landmarker, frame_rgb: np.ndarray, mask: np.ndarray,
 
 # ──────────────────────── per-frame selection ────────────────────────
 
+def gate_kpts_in_mask(kpts: np.ndarray, mask: np.ndarray) -> tuple[bool, float]:
+    """Fraction of kpts lying inside the actual tracker mask (not the hull).
+    Stricter than gate_kpts_in_hull: discriminates coworker-hand candidates
+    that fall inside the wearer mask's hull region but not on the actual
+    wearer-hand pixels.
+    """
+    if mask is None or mask.sum() == 0:
+        return False, 0.0
+    H, W = mask.shape[:2]
+    inside = 0
+    for (x, y) in kpts:
+        xi = int(round(float(x))); yi = int(round(float(y)))
+        if 0 <= xi < W and 0 <= yi < H and bool(mask[yi, xi]):
+            inside += 1
+    frac = inside / max(len(kpts), 1)
+    return (frac >= MASK_KPTS_MIN_FRAC), frac
+
+
 def gate_candidate(kpts: np.ndarray, mask_hull: np.ndarray, hull_diag: float,
-                    mask_bbox) -> tuple[bool, dict]:
+                    mask_bbox, mask: np.ndarray | None = None
+                    ) -> tuple[bool, dict]:
     """Run the wrist + kpts + size gates on a candidate pose against an obj_id's
-    mask. Returns (passes, gate_diag_dict)."""
+    mask. If `mask` is given AND MASK_KPTS_MIN_FRAC > 0, also requires a
+    minimum fraction of kpts inside the actual mask (not just the hull).
+    Returns (passes, gate_diag_dict)."""
     diag = {}
     wpass, wdist, wthresh = gate_wrist_near_hull(kpts[0], mask_hull, hull_diag)
     diag["wrist_dist_to_hull_px"] = wdist
@@ -461,22 +567,29 @@ def gate_candidate(kpts: np.ndarray, mask_hull: np.ndarray, hull_diag: float,
     diag["kpts_in_hull"] = kpass
     if not kpass:
         return False, diag
-    spass, sratio = gate_size_sanity(kpts, mask_bbox)
+    spass, sratio = gate_size_sanity(kpts, mask_hull)
     diag["pose_bbox_to_mask_bbox_ratio"] = sratio
     diag["size_sanity"] = spass
     if not spass:
         return False, diag
+    if MASK_KPTS_MIN_FRAC > 0 and mask is not None:
+        mpass, mfrac = gate_kpts_in_mask(kpts, mask)
+        diag["kpts_in_mask_frac"] = mfrac
+        diag["kpts_in_mask"] = mpass
+        if not mpass:
+            return False, diag
     return True, diag
 
 
-def select_best_for_obj(mp_dets: list[dict], mask_hull, hull_diag, mask_bbox
+def select_best_for_obj(mp_dets: list[dict], mask_hull, hull_diag, mask_bbox,
+                         mask: np.ndarray | None = None
                          ) -> tuple[dict | None, list[dict]]:
     """Return the best-scoring MP detection that passes all gates for this obj_id,
     along with per-candidate gate diagnostics."""
     diag_per_cand = []
     qualifying = []
     for i, det in enumerate(mp_dets):
-        passes, gd = gate_candidate(det["keypoints"], mask_hull, hull_diag, mask_bbox)
+        passes, gd = gate_candidate(det["keypoints"], mask_hull, hull_diag, mask_bbox, mask=mask)
         diag_per_cand.append({"cand_idx": i, "score": det["score"], **gd})
         if passes:
             qualifying.append(det)
@@ -525,10 +638,83 @@ def draw_frame_number(img, fidx: int):
 
 # ──────────────────────── orchestration ────────────────────────
 
+def interpolate_short_compressed_runs(per_frame: list[dict]) -> list[dict]:
+    """For each obj_id, find runs of consecutive frames whose entry has
+    `mp_video_compressed_ratio` set (the cascade rejected MP video VIDEO
+    for being too compressed). Runs of length <= COMPRESSED_INTERP_MAX_LEN
+    that are bracketed on BOTH sides by frames whose source is 'mp_video'
+    (uncompressed accepts) get linearly interpolated; the backup-cascade
+    decision is overwritten with the interpolation. Longer runs keep the
+    backup cascade result.
+
+    Returns a log of interpolation events.
+    """
+    log: list[dict] = []
+    if not per_frame:
+        return log
+    n = len(per_frame)
+    def get_entry(fi: int, oid: int) -> dict | None:
+        for h in per_frame[fi]["hands"]:
+            if h["obj_id"] == oid:
+                return h
+        return None
+    for oid in (0, 1):
+        i = 0
+        while i < n:
+            e = get_entry(i, oid)
+            if e is None or "mp_video_compressed_ratio" not in e:
+                i += 1
+                continue
+            run_start = i
+            while i < n:
+                e2 = get_entry(i, oid)
+                if e2 is None or "mp_video_compressed_ratio" not in e2:
+                    break
+                i += 1
+            run_end = i - 1
+            run_len = run_end - run_start + 1
+            if run_len > COMPRESSED_INTERP_MAX_LEN:
+                continue
+            prev_idx = None
+            for k in range(run_start - 1, -1, -1):
+                pe = get_entry(k, oid)
+                if pe is not None and pe.get("source") == "mp_video" and pe.get("keypoints") is not None:
+                    prev_idx = k
+                    break
+            next_idx = None
+            for k in range(run_end + 1, n):
+                ne = get_entry(k, oid)
+                if ne is not None and ne.get("source") == "mp_video" and ne.get("keypoints") is not None:
+                    next_idx = k
+                    break
+            if prev_idx is None or next_idx is None:
+                continue
+            prev_kp = np.asarray(get_entry(prev_idx, oid)["keypoints"], dtype=np.float32)
+            next_kp = np.asarray(get_entry(next_idx, oid)["keypoints"], dtype=np.float32)
+            span = next_idx - prev_idx
+            for fi in range(run_start, run_end + 1):
+                t = (fi - prev_idx) / span
+                interp_kp = (1.0 - t) * prev_kp + t * next_kp
+                e = get_entry(fi, oid)
+                e["keypoints"] = interp_kp.tolist()
+                e["source"] = "interpolated"
+                e["rejected_reason"] = None
+                e["kp_confidences"] = [0.05] * 21
+            log.append({
+                "obj_id": oid, "run": [run_start, run_end],
+                "run_len": run_len, "prev_idx": prev_idx, "next_idx": next_idx,
+            })
+    for rec in per_frame:
+        for h in rec["hands"]:
+            h.pop("mp_video_compressed_ratio", None)
+    return log
+
+
 def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                        mp_video, mp_image, max_frames: int | None = None,
                        vitpose=None,
-                       mp_video_short_edge: int | None = None) -> dict:
+                       mp_video_short_edge: int | None = None,
+                       mp_video_image=None) -> dict:
     stem = video_path.stem
     frames_json_path = track_dir / f"{stem}_track.frames.json"
     track_json_path = track_dir / f"{stem}_track.json"
@@ -558,7 +744,7 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
         vitpose.run_video(video_path, max_frames=total_frames)
 
     out_video = out_dir / f"{stem}_pose.mp4"
-    writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    # Writer is created after the cascade loop + post-process (two-pass design).
 
     for fidx in range(total_frames):
         ok, bgr = cap.read()
@@ -596,6 +782,9 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
         else:
             rgb_for_mp = rgb
         mp_dets = run_mp_video_frame(mp_video, rgb_for_mp, ts_ms, out_W=W, out_H=H)
+        # Lazy IMAGE-mode detections; computed only when at least one
+        # obj's VIDEO-mode candidate fails the compression gate.
+        mp_dets_image_cache: list[dict] | None = None
 
         frame_record = {"frame": fidx, "hands": []}
         accepted_pts: dict[int, np.ndarray] = {}
@@ -618,131 +807,143 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                 frame_record["hands"].append(entry)
                 continue
 
-            best, diag_per_cand = select_best_for_obj(
+            # Try each detector path in order. Each candidate must pass both
+            # the hull gates AND the temporal-jump check; the first one that
+            # passes both wins. This lets MP image / wide / ViTPose rescue
+            # frames where MP video found a hull-passing candidate that then
+            # failed the temporal jump (e.g. MP picked a wrong hand from
+            # among multiple in-frame, while MP image masked or wide was
+            # forced to look in the right region).
+            mp_video_best, diag_per_cand = select_best_for_obj(
                 mp_dets, hulls[oid], hull_diags[oid], mask_bboxes[oid],
+                mask=masks[oid],
             )
             entry["candidates_diag"] = diag_per_cand
 
-            if best is None:
-                # IMAGE-mode rerun on the mask-derived crop (dilated mask
-                # bbox, with background pixels outside the dilated mask
-                # zeroed). Focuses MP on the actual hand pixels.
-                rerun = run_mp_image_masked(mp_image, rgb, masks[oid])
-                if rerun is not None:
-                    passes, gd = gate_candidate(
-                        rerun["keypoints"], hulls[oid], hull_diags[oid], mask_bboxes[oid],
-                    )
-                    entry["gate_diag"] = gd
-                    if passes:
-                        best = rerun
-                        entry["source"] = "mp_image_rerun"
-                    else:
-                        entry["rejected_reason"] = "image_rerun_gate_fail"
-                else:
-                    entry["rejected_reason"] = "image_rerun_no_detection"
+            best = None
+            attempt_fails: list[str] = []
 
-                # Wide-crop MP image fallback: square crop expanded around the
-                # mask, no background zeroing. Gives MP enough surrounding
-                # context for closed-fist / dorsal-view / small-mask cases
-                # where the tight masked crop is too context-starved.
-                if best is None:
-                    wide = run_mp_image_wide(mp_image, rgb, masks[oid])
-                    if wide is not None:
-                        passes, gd = gate_candidate(
-                            wide["keypoints"], hulls[oid], hull_diags[oid], mask_bboxes[oid],
-                        )
-                        entry["wide_gate_diag"] = gd
-                        if passes:
-                            best = wide
-                            entry["source"] = "mp_image_rerun_wide"
-                            entry["rejected_reason"] = None
-                        else:
-                            entry["rejected_reason"] = (
-                                (entry["rejected_reason"] or "") + "_then_wide_gate_fail"
-                                if entry["rejected_reason"] else "wide_gate_fail"
-                            )
-                    else:
-                        entry["rejected_reason"] = (
-                            (entry["rejected_reason"] or "") + "_then_wide_no_detection"
-                            if entry["rejected_reason"] else "wide_no_detection"
-                        )
-
-                # ViTPose backup: only when both MP attempts failed AND we
-                # know which anatomical side this obj_id is (the wearer
-                # L / R label from the tracker labeler). Pick the matching
-                # side's hand keypoints from the ViTPose pass and gate them.
-                if best is None and vit_active:
-                    side = handedness_by_oid.get(oid)
-                    if side in ("left", "right"):
-                        v_kpts, v_kp_scores = vitpose.get_for_side(video_path, fidx, side)
-                        if v_kpts is not None and v_kpts.shape == (21, 2):
-                            passes, gd = gate_candidate(
-                                v_kpts, hulls[oid], hull_diags[oid], mask_bboxes[oid],
-                            )
-                            v_mean = float(v_kp_scores.mean()) if v_kp_scores is not None else 0.0
-                            entry["vitpose_gate_diag"] = gd
-                            entry["vitpose_mean_score"] = v_mean
-                            if passes:
-                                best = {"keypoints": v_kpts, "score": v_mean,
-                                        "handedness": side.capitalize(),
-                                        "kp_confidences": v_kp_scores}
-                                entry["source"] = "vitpose_huge"
-                                entry["rejected_reason"] = None
-                            else:
-                                if entry["rejected_reason"]:
-                                    entry["rejected_reason"] += "_then_vit_gate_fail"
-                                else:
-                                    entry["rejected_reason"] = "vit_gate_fail"
-            else:
-                entry["source"] = "mp_video"
-
-            if best is not None:
-                # Temporal jump check
-                jump_ok, jump_px = gate_temporal_jump(
-                    best["keypoints"], prev_pose[oid], image_diag,
+            def _try(cand: dict | None, source_name: str, gate_diag_key: str,
+                      no_det_tag: str, gate_tag: str, jump_tag: str) -> dict | None:
+                """Run gate_candidate + temporal_jump on `cand`. On pass,
+                set entry['source'] and return cand. On fail, append a tag
+                to attempt_fails and return None."""
+                if cand is None:
+                    attempt_fails.append(no_det_tag)
+                    return None
+                passes, gd = gate_candidate(
+                    cand["keypoints"], hulls[oid], hull_diags[oid], mask_bboxes[oid],
+                    mask=masks[oid],
+                )
+                if gate_diag_key:
+                    entry[gate_diag_key] = gd
+                if not passes:
+                    attempt_fails.append(gate_tag)
+                    return None
+                jump_ok, jp = gate_temporal_jump(
+                    cand["keypoints"], prev_pose[oid], image_diag,
+                    prev_age=prev_pose_age[oid],
                 )
                 if not jump_ok:
-                    # Reject and try to carry forward
-                    entry["rejected_reason"] = f"temporal_jump_{jump_px:.0f}px"
-                    if prev_pose[oid] is not None and prev_pose_age[oid] < CONT_CARRYFWD_MAX_FRAMES:
-                        entry["source"] = "carryforward"
-                        entry["keypoints"] = snap_pose_to_mask(
-                            prev_pose[oid], hulls[oid], hull_diags[oid],
-                        )
-                        entry["kp_confidences"] = np.full(21, 0.05, dtype=np.float32)
-                        prev_pose_age[oid] += 1
-                    else:
-                        # Carryforward window exhausted: release the stale
-                        # prev_pose so the next fresh detection can re-acquire.
-                        # Without this, prev_pose is pinned forever and every
-                        # subsequent MP-video detection is rejected as a jump
-                        # against a many-frames-old pose.
-                        entry["keypoints"] = None
-                        prev_pose[oid] = None
-                        prev_pose_age[oid] = CONT_CARRYFWD_MAX_FRAMES
-                else:
-                    entry["keypoints"] = best["keypoints"]
-                    entry["mp_score"] = best["score"]
-                    entry["kp_confidences"] = best.get("kp_confidences")
-                    prev_pose[oid] = best["keypoints"]
-                    prev_pose_age[oid] = 0
+                    attempt_fails.append(f"{jump_tag}_{jp:.0f}px")
+                    return None
+                entry["source"] = source_name
+                return cand
+
+            # 1. MP video best candidate. Additionally check size: if the
+            #    accepted pose's area is < MP_VIDEO_MIN_AREA_RATIO of mask
+            #    area, treat as compressed (tucked-finger from VIDEO-mode
+            #    tracking) and fall through. The post-pass can interpolate
+            #    short compressed runs, while longer runs use the backup
+            #    cascade results.
+            best = _try(mp_video_best, "mp_video", "gate_diag",
+                         "mp_video_no_candidate", "mp_video_gate_fail",
+                         "mp_video_temporal_jump")
+            if best is not None:
+                mask_a = mask_hull_area(hulls[oid])
+                pose_a = hull_area(best["keypoints"])
+                area_ratio = pose_a / mask_a if mask_a > 0 else 1.0
+                if area_ratio < MP_VIDEO_MIN_AREA_RATIO:
+                    attempt_fails.append(f"mp_video_compressed_{area_ratio:.2f}")
+                    entry["mp_video_compressed_ratio"] = round(area_ratio, 3)
+                    entry["source"] = None
+                    best = None
+            # 2. MP video IMAGE mode (no tracking) — first backup. Pick its
+            #    best candidate matching this obj's hull, then apply the
+            #    same hull-area size gate at MP_VIDEO_IMAGE_MIN_AREA_RATIO.
+            if best is None and mp_video_image is not None:
+                if mp_dets_image_cache is None:
+                    mp_dets_image_cache = run_mp_video_frame_image(
+                        mp_video_image, rgb_for_mp, out_W=W, out_H=H,
+                    )
+                mp_img_best, _ = select_best_for_obj(
+                    mp_dets_image_cache, hulls[oid], hull_diags[oid],
+                    mask_bboxes[oid], mask=masks[oid],
+                )
+                best = _try(mp_img_best, "mp_video_image", "video_image_gate_diag",
+                             "mp_video_image_no_candidate",
+                             "mp_video_image_gate_fail",
+                             "mp_video_image_temporal_jump")
+                if best is not None:
+                    mask_a = mask_hull_area(hulls[oid])
+                    pose_a = hull_area(best["keypoints"])
+                    area_ratio = pose_a / mask_a if mask_a > 0 else 1.0
+                    if area_ratio < MP_VIDEO_IMAGE_MIN_AREA_RATIO:
+                        attempt_fails.append(f"mp_video_image_compressed_{area_ratio:.2f}")
+                        entry["source"] = None
+                        best = None
+            # 2. MP image rerun (mask-zeroed tight crop)
+            if best is None:
+                best = _try(run_mp_image_masked(mp_image, rgb, masks[oid]),
+                             "mp_image_rerun", "gate_diag",
+                             "image_rerun_no_detection", "image_rerun_gate_fail",
+                             "image_rerun_temporal_jump")
+            # 3. MP image wide (no background zeroing)
+            if best is None:
+                best = _try(run_mp_image_wide(mp_image, rgb, masks[oid]),
+                             "mp_image_rerun_wide", "wide_gate_diag",
+                             "wide_no_detection", "wide_gate_fail",
+                             "wide_temporal_jump")
+            # 4. ViTPose backup (requires wearer L/R label)
+            if best is None and vit_active:
+                side = handedness_by_oid.get(oid)
+                if side in ("left", "right"):
+                    v_kpts, v_kp_scores = vitpose.get_for_side(video_path, fidx, side)
+                    v_cand = None
+                    if v_kpts is not None and v_kpts.shape == (21, 2):
+                        v_mean = float(v_kp_scores.mean()) if v_kp_scores is not None else 0.0
+                        entry["vitpose_mean_score"] = v_mean
+                        v_cand = {"keypoints": v_kpts, "score": v_mean,
+                                   "handedness": side.capitalize(),
+                                   "kp_confidences": v_kp_scores}
+                    best = _try(v_cand, "vitpose_huge", "vitpose_gate_diag",
+                                 "vit_no_detection", "vit_gate_fail",
+                                 "vit_temporal_jump")
+
+            if best is not None:
+                entry["keypoints"] = best["keypoints"]
+                entry["mp_score"] = best.get("score")
+                entry["kp_confidences"] = best.get("kp_confidences")
+                entry["rejected_reason"] = None
+                prev_pose[oid] = best["keypoints"]
+                prev_pose_age[oid] = 0
             else:
-                # No accepted candidate; try carry-forward
+                # All paths failed. Record the chain for diagnostics, then
+                # carryforward if we still have a recent accepted pose.
+                entry["rejected_reason"] = "_then_".join(attempt_fails) or "no_paths_tried"
                 if prev_pose[oid] is not None and prev_pose_age[oid] < CONT_CARRYFWD_MAX_FRAMES:
                     entry["source"] = "carryforward"
-                    # Snap held pose to the current mask hull so the rendered
-                    # skeleton stays anchored to the actual hand location.
                     entry["keypoints"] = snap_pose_to_mask(
                         prev_pose[oid], hulls[oid], hull_diags[oid],
                     )
-                    # Carryforward is uncertain; mark per-kp confidence low so
-                    # the downstream Kalman smoother trusts the model over
-                    # the held value.
                     entry["kp_confidences"] = np.full(21, 0.05, dtype=np.float32)
                     prev_pose_age[oid] += 1
                 else:
+                    # Window exhausted: release stale prev_pose so the next
+                    # fresh detection can re-acquire.
+                    entry["keypoints"] = None
                     prev_pose[oid] = None
-                    prev_pose_age[oid] = CONT_CARRYFWD_MAX_FRAMES  # locked off
+                    prev_pose_age[oid] = CONT_CARRYFWD_MAX_FRAMES
 
             if entry["keypoints"] is not None:
                 accepted_pts[oid] = entry["keypoints"]
@@ -750,17 +951,51 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
 
         per_frame.append(frame_record)
 
-        # Render overlay
+    cap.release()
+
+    # ── Post-process: short compressed-MP-video runs ───────────────────
+    # Identify runs of consecutive frames where MP video VIDEO was
+    # rejected for compression (mp_video_compressed_ratio set on entry).
+    # Short runs (<= COMPRESSED_INTERP_MAX_LEN) bracketed by uncompressed
+    # mp_video accepts get linearly interpolated, overwriting the
+    # backup-cascade decision.
+    interp_log = interpolate_short_compressed_runs(per_frame)
+
+    # ── Re-render mp4 using final (post-processed) entries ─────────────
+    writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    cap = cv2.VideoCapture(str(video_path))
+    for fidx in range(total_frames):
+        ok, bgr = cap.read()
+        if not ok:
+            break
+        f_entry = frames_meta["frames"][fidx]
+        masks: dict[int, np.ndarray] = {}
+        for h in f_entry["hands"]:
+            if h.get("mask_rle") is None:
+                continue
+            m = decode_mask_rle(h["mask_rle"])
+            if m.sum() > 0:
+                masks[int(h["obj_id"])] = m
+        hulls = {}
+        for oid, m in masks.items():
+            hull, _, _ = largest_cc_hull(m)
+            hulls[oid] = hull
+        rec = per_frame[fidx]
         overlay = bgr.copy()
         for oid, m in masks.items():
             overlay = overlay_mask(overlay, m, MASK_COLORS_BGR[oid % 2])
             draw_mask_hull(overlay, hulls[oid], HULL_COLORS_BGR[oid % 2])
-        for oid, pts in accepted_pts.items():
+        for h in rec["hands"]:
+            kp = h.get("keypoints")
+            if kp is None:
+                continue
+            oid = int(h["obj_id"])
+            pts = np.asarray(kp, dtype=np.float32)
             draw_skeleton(overlay, pts, MASK_COLORS_BGR[oid % 2])
             wx, wy = int(round(pts[0][0])), int(round(pts[0][1]))
             tag = handedness_by_oid.get(oid)
             tag_short = "L" if tag == "left" else "R" if tag == "right" else "?"
-            src = next(h["source"] for h in frame_record["hands"] if h["obj_id"] == oid)
+            src = h.get("source") or "-"
             text = f"{tag_short} obj{oid} {src}"
             cv2.putText(overlay, text, (wx + 14, wy - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
@@ -768,7 +1003,6 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, LABEL_TEXT_COLOR, 2, cv2.LINE_AA)
         draw_frame_number(overlay, fidx)
         writer.write(overlay)
-
     cap.release()
     writer.release()
 
@@ -846,11 +1080,18 @@ def parse_args():
                          "wearer L/R label.")
     ap.add_argument("--vitpose-ckpt", default=None,
                     help="Override ViTPose checkpoint path.")
+    ap.add_argument("--mask-kpts-min-frac", type=float, default=None,
+                    help=f"Override MASK_KPTS_MIN_FRAC. Min fraction of keypoints "
+                         f"that must lie inside the actual tracker mask (not just "
+                         f"the convex hull). 0.0 disables. Default: {MASK_KPTS_MIN_FRAC}.")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.mask_kpts_min_frac is not None:
+        global MASK_KPTS_MIN_FRAC
+        MASK_KPTS_MIN_FRAC = float(args.mask_kpts_min_frac)
     root = Path(__file__).resolve().parents[1]
     track_dir = Path(args.track_dir).resolve() if args.track_dir else latest_track_dir(root / args.output_base)
     source_dir = Path(args.source_dir).resolve() if args.source_dir else (root / "data")
@@ -891,6 +1132,9 @@ def main():
         try:
             # MP VIDEO mode needs a fresh landmarker per video (monotonic ts_ms).
             mp_video = make_mp(mp_vision.RunningMode.VIDEO, num_hands=MP_NUM_HANDS_VIDEO)
+            # IMAGE-mode landmarker used as first backup when VIDEO-mode
+            # tracking returns a compressed pose.
+            mp_video_image = make_mp(mp_vision.RunningMode.IMAGE, num_hands=MP_NUM_HANDS_VIDEO)
             cap = cv2.VideoCapture(str(video_path))
             fps_native = cap.get(cv2.CAP_PROP_FPS) or 30.0
             cap.release()
@@ -899,8 +1143,10 @@ def main():
                 video_path, track_dir, out_dir, mp_video, mp_image,
                 max_frames=max_frames, vitpose=vitpose,
                 mp_video_short_edge=MP_VIDEO_SHORT_EDGE,
+                mp_video_image=mp_video_image,
             )
             mp_video.close()
+            mp_video_image.close()
             if vitpose is not None:
                 # Drop this video's cache to avoid retaining all frames in RAM.
                 vitpose._cache.pop(video_path, None)

@@ -48,6 +48,12 @@ SKEL_COLOR = (255, 0, 255)
 KP_COLOR = (255, 0, 255)
 WRIST_COLOR = (0, 255, 255)
 LABEL_TEXT_COLOR = (0, 255, 255)
+# Gap-skip rule: when a stretch of frames has no fresh detection (valid==False)
+# AND the mask has moved a lot between the bracketing accepted frames, the
+# smoother's interpolation is unreliable -- mark those frames as missing
+# instead of rendering an extrapolated pose.
+SKIP_MAX_GAP_FRAMES = 5             # gap LARGER than this triggers the motion check
+SKIP_MAX_MASK_MOTION_FRAC = 0.05    # mask centroid move > this * image diag -> skip
 HAND_CONNECTIONS = (
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -195,6 +201,41 @@ def smooth_keypoints_per_obj(per_frame_kpts: list[np.ndarray | None],
 
 # ──────────────────────── IO helpers ────────────────────────
 
+def compute_skip_intervals(valid: np.ndarray,
+                            mask_centroids: list[tuple[float, float] | None],
+                            image_diag: float,
+                            max_gap: int = SKIP_MAX_GAP_FRAMES,
+                            max_motion_frac: float = SKIP_MAX_MASK_MOTION_FRAC
+                            ) -> np.ndarray:
+    """For each gap of consecutive False entries in `valid` whose length is
+    greater than `max_gap`, check the L2 displacement of the mask centroid
+    between the bracketing valid frames. If the gap is long AND the hand
+    moved a lot, mark every frame in the gap as 'skip' (return True). The
+    smoother's interpolation across that gap is unreliable; the caller
+    should NaN out the smoothed pose for those frames.
+    """
+    N = len(valid)
+    skip = np.zeros(N, dtype=bool)
+    valid_idxs = np.where(valid)[0]
+    if len(valid_idxs) < 2:
+        return skip
+    thresh_px = max_motion_frac * image_diag
+    for i in range(len(valid_idxs) - 1):
+        a = int(valid_idxs[i])
+        b = int(valid_idxs[i + 1])
+        gap_len = b - a - 1
+        if gap_len <= max_gap:
+            continue
+        ca = mask_centroids[a] if a < len(mask_centroids) else None
+        cb = mask_centroids[b] if b < len(mask_centroids) else None
+        if ca is None or cb is None:
+            continue
+        motion = float(np.hypot(cb[0] - ca[0], cb[1] - ca[1]))
+        if motion > thresh_px:
+            skip[a + 1 : b] = True
+    return skip
+
+
 def decode_mask_rle(rle: dict) -> np.ndarray:
     raw = {"size": list(rle["size"]), "counts": rle["counts"].encode("ascii")}
     return coco_mask.decode(raw).astype(bool)
@@ -215,11 +256,11 @@ def largest_cc_hull(mask: np.ndarray):
     return cv2.convexHull(pts)
 
 
-def overlay_mask(img, mask, color_bgr):
+def overlay_mask(img, mask, color_bgr, alpha: float = 0.45):
     if mask is None or mask.sum() == 0:
         return img
     color = np.array(color_bgr, dtype=np.uint8)
-    img[mask] = (0.55 * img[mask] + 0.45 * color).astype(np.uint8)
+    img[mask] = ((1.0 - alpha) * img[mask] + alpha * color).astype(np.uint8)
     return img
 
 
@@ -307,8 +348,41 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
         return {"video": stem, "error": "tracker frames.json missing"}
     track_frames = json.loads(track_frames_json.read_text())
 
+    # Per-frame mask centroids per obj, used by the gap-skip rule.
+    mask_centroids: dict[int, list[tuple[float, float] | None]] = {
+        0: [None] * n_frames, 1: [None] * n_frames}
+    for fi, fr in enumerate(track_frames["frames"]):
+        if fi >= n_frames:
+            break
+        for h in fr["hands"]:
+            if h.get("mask_rle") is None:
+                continue
+            oid = int(h["obj_id"])
+            if oid not in mask_centroids:
+                continue
+            m = decode_mask_rle(h["mask_rle"])
+            if m.sum() == 0:
+                continue
+            ys, xs = np.where(m)
+            mask_centroids[oid][fi] = (float(xs.mean()), float(ys.mean()))
+
+    # Gap-skip: when the smoother has interpolated across a long no-detection
+    # gap during which the hand moved a lot, NaN out the smoothed pose for
+    # those frames so downstream consumers see the gap as missing.
+    image_diag = float(np.hypot(W, H))
+    skip_stats: dict[int, dict] = {0: {}, 1: {}}
+    for oid in (0, 1):
+        skip = compute_skip_intervals(
+            valid_in[oid], mask_centroids[oid], image_diag,
+        )
+        if skip.any():
+            smoothed_seq[oid][skip] = np.nan
+        skip_stats[oid] = {"skipped_frames": int(skip.sum())}
+
     out_mp4 = out_dir / f"{stem}_pose_smooth.mp4"
+    out_mp4_clean = out_dir / f"{stem}_pose_smooth_clean.mp4"
     writer = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    writer_clean = cv2.VideoWriter(str(out_mp4_clean), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
     cap = cv2.VideoCapture(str(src_video))
 
     for fi in range(n_frames):
@@ -316,7 +390,9 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
         if not ok:
             break
         overlay = bgr.copy()
-        # Tracker mask + hull background
+        overlay_clean = bgr.copy()
+        # Tracker mask + (full only) hull background; clean version uses a
+        # lighter mask alpha (0.20 vs 0.45) and skips the convex-hull outline.
         if fi < len(track_frames["frames"]):
             for h in track_frames["frames"][fi]["hands"]:
                 if h.get("mask_rle") is None:
@@ -327,7 +403,9 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
                 oid = int(h["obj_id"])
                 overlay = overlay_mask(overlay, m, MASK_COLORS_BGR[oid % 2])
                 draw_mask_hull(overlay, largest_cc_hull(m), HULL_COLORS_BGR[oid % 2])
-        # Smoothed skeletons
+                overlay_clean = overlay_mask(overlay_clean, m,
+                                              MASK_COLORS_BGR[oid % 2], alpha=0.20)
+        # Smoothed skeletons (both videos get the same skeleton)
         for oid in (0, 1):
             if not valid_in[oid].any():
                 continue
@@ -340,6 +418,7 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
             if np.isnan(pts).any():
                 continue
             draw_skeleton(overlay, pts)
+            draw_skeleton(overlay_clean, pts)
             wx, wy = int(round(pts[0, 0])), int(round(pts[0, 1]))
             handed = handedness_by_oid.get(oid)
             tag_short = "L" if handed == "left" else "R" if handed == "right" else "?"
@@ -348,11 +427,18 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
             cv2.putText(overlay, label, (wx + 14, wy - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, LABEL_TEXT_COLOR, 2, cv2.LINE_AA)
+            cv2.putText(overlay_clean, label, (wx + 14, wy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(overlay_clean, label, (wx + 14, wy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, LABEL_TEXT_COLOR, 2, cv2.LINE_AA)
         draw_frame_number(overlay, fi)
+        draw_frame_number(overlay_clean, fi)
         writer.write(overlay)
+        writer_clean.write(overlay_clean)
 
     cap.release()
     writer.release()
+    writer_clean.release()
 
     # Smoothed JSON dump
     out_json = out_dir / f"{stem}_pose_smooth.json"
@@ -384,7 +470,8 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
         },
         "frames": serial_frames,
     }))
-    return {"video": stem, "pose_video": out_mp4.name, "pose_json": out_json.name}
+    return {"video": stem, "pose_video": out_mp4.name, "pose_json": out_json.name,
+            "gap_skip_per_obj": skip_stats}
 
 
 def parse_args():

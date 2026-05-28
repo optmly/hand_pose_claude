@@ -7,6 +7,85 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0014] - 2026-05-28
+
+### Added
+- Tracker: multi-CC mask preservation in
+  [src/track_video_sam2.py](src/track_video_sam2.py). New
+  `keep_substantial_proximal_ccs` (≥5% of total area AND within 10% of
+  the largest CC's bbox diagonal) replaces the aggressive
+  `keep_largest_cc` cleanup. Tool/utensil-separated fingers are now
+  retained instead of being discarded. `mask_bbox` updated to use the
+  same rule so the rendered bbox covers all kept CCs.
+- Tracker `--output-dir` CLI flag for fixed output paths (per-video
+  subprocess loops can now all write to one dir, avoiding SAM 2's
+  frame-loader OOM on long-running invocations).
+- Pose cascade refactor in
+  [src/pose_video_v2.py](src/pose_video_v2.py): every detector path
+  (mp_video → mp_video_image → mp_image_rerun → mp_image_rerun_wide →
+  vitpose_huge) must pass both the hull gates AND temporal_jump; first
+  to pass wins. Allows mp_image / wide / vitpose to rescue frames where
+  the MP video pick failed the jump check.
+- Gap-scaled temporal_jump threshold: base × √(1 + prev_age).
+  Accommodates real hand motion across short stretches with no fresh
+  detection without spurious jump rejections.
+- MP image wide-crop fallback (`run_mp_image_wide`): square crop
+  expanded by 75% around the mask, no background zeroing. Gives MP
+  enough context for closed-fist / dorsal-view cases where the tight
+  mask-zeroed crop is context-starved.
+- 20%-expanded convex-hull check on `gate_kpts_in_hull` so fingertips
+  extending a few px past the SAM mask hull pass without loosening the
+  50%-in-hull threshold itself.
+- Snap-to-mask carryforward: held pose is translated + scaled to align
+  with the current mask hull centroid + diagonal. Rendered skeleton
+  stays anchored to the actual hand instead of drifting at the stale
+  frame's coordinates.
+- Pose-size floor `POSE_BBOX_MIN_RATIO=0.30` (lower bound on
+  pose-hull / mask-hull area ratio) rejects degenerate MP image
+  detections that collapse all 21 kpts into a tiny cluster.
+- MP video VIDEO mode "compression gate"
+  (`MP_VIDEO_MIN_AREA_RATIO=0.45`): when the VIDEO-mode tracked pose
+  has pose-hull / mask-hull area ratio < 0.45, the frame falls through
+  the cascade. Catches the tucked-finger pose held from a prior
+  grasping frame.
+- MP video IMAGE mode (`run_mp_video_frame_image`) as the first
+  cascade backup with the same 0.45 hull-area threshold. Provides a
+  no-tracking re-detection for compressed VIDEO-mode outputs.
+- Post-pass interpolation
+  (`interpolate_short_compressed_runs`): runs of consecutive
+  compressed MP-video frames ≤ `COMPRESSED_INTERP_MAX_LEN`=7 that are
+  bracketed by uncompressed mp_video accepts get linearly interpolated
+  from the bracketing keypoints, overriding the backup-cascade
+  decision. Longer runs keep the cascade output.
+- Hull-area helpers (`hull_area`, `mask_hull_area`) so size checks are
+  scale-invariant against hand orientation (bbox-area was biased by
+  axis alignment).
+- `gate_kpts_in_mask` + `--mask-kpts-min-frac` CLI flag (disabled by
+  default) for stricter coworker-hand filtering when needed.
+- Kalman smoother
+  [src/kalman_smooth_pose.py](src/kalman_smooth_pose.py): gap-skip
+  rule — when a gap between accepted measurements is > 5 frames AND
+  the mask centroid moved > 5% of image diagonal, the smoother's
+  interpolation across the gap is NaN'd out (the gap is treated as
+  missing instead of extrapolating across an unreliable stretch).
+- Second smoothed video per source: `<stem>_pose_smooth_clean.mp4` —
+  no convex hull, lighter mask alpha (0.20 vs 0.45), skeleton only.
+
+### Fixed
+- Pose: temporal_jump prev_pose reset when carryforward window
+  exhausted. Previously prev_pose stayed pinned forever, causing
+  every subsequent MP-video detection to be rejected as a jump
+  against a many-frames-old anchor.
+
+### Result (50 videos × 30 s, release_50_v3)
+- Tracker: 50/50 succeeded, 50/50 both hands labeled.
+- Pose: 68,263 / 69,849 accepted (97.73%); 1,268 carryforward
+  (1.82%); 318 missing (0.46%). 29/50 videos have zero misses.
+- Source mix: mp_video 84.4%, vitpose 6.4%, interpolated 3.6%,
+  mp_image_rerun 2.5%, mp_video_image 2.0%, mp_image_rerun_wide
+  1.0%. The new interpolation + IMAGE-mode paths contribute 3,810
+  accepted poses (5.6% of total).
+
 ## [0013] - 2026-05-26
 
 ### Added
