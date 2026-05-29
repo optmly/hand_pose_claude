@@ -435,9 +435,24 @@ def process_one_video(pose_json_path: Path, track_dir: Path, source_dir: Path,
 
     out_mp4 = out_dir / f"{stem}_pose_smooth.mp4"
     out_mp4_clean = out_dir / f"{stem}_pose_smooth_clean.mp4"
+    if not (W > 0 and H > 0 and fps > 0):
+        return {"video": stem, "error": f"bad video params W={W} H={H} fps={fps}"}
     writer = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
     writer_clean = cv2.VideoWriter(str(out_mp4_clean), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    if not (writer.isOpened() and writer_clean.isOpened()):
+        return {"video": stem, "error": f"cv2.VideoWriter failed to open ({W}x{H}@{fps})"}
     cap = cv2.VideoCapture(str(src_video))
+    # Fail fast on a source-resolution mismatch (same footgun as the pose
+    # stage): the smoother renders at (W, H) from the pose JSON, so the
+    # source video must match. A full-res --source-dir would desync coords.
+    vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if (vid_w, vid_h) != (int(W), int(H)):
+        cap.release()
+        return {"video": stem, "error":
+                f"source video {vid_w}x{vid_h} != pose size {W}x{H}; "
+                f"--source-dir likely points at full-res data instead of "
+                f"<track_dir>/inputs"}
 
     for fi in range(n_frames):
         ok, bgr = cap.read()

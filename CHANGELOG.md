@@ -7,6 +7,75 @@ Versions use a zero-padded four-digit scheme starting from `0001`.
 
 ## [Unreleased]
 
+## [0016] - 2026-05-29
+
+Code-review hardening pass (no coverage change; correctness + safety +
+perf). Verified on 50 videos × 30 s: accepted 67,089 / effective
+(96.40%), missing 577 (0.83%) — statistically identical to 0015's run,
+with cleaner masks and faster ViTPose.
+
+### Fixed
+- Tracker `redetect_lost_tracks` mask clobber
+  ([src/track_video_sam2.py](src/track_video_sam2.py)): after re-seeding
+  only the lost obj_id, the forward re-propagation did
+  `masks_per_frame[fidx] = per_obj`, a full per-frame REPLACE. Since SAM 2
+  `propagate_in_video` yields ALL tracked obj_ids, this overwrote the
+  non-lost hand's already-merged forward+backward masks with plain
+  forward-only propagation. Now writes back only the lost obj_id's masks
+  (`.update()` with lost-oids only). On 20×30 s this preserved 1,219
+  non-lost-hand frames across 9 videos (redetect fires on 17/20); both
+  hands stay tracked everywhere, and the changed masks are tighter
+  (less forearm bleed).
+
+### Added
+- Fail-fast source-resolution guards in the pose and smoother stages:
+  if the source video's WxH doesn't match the tracker masks
+  (`frames_meta["size"]`) — the classic "--source-dir points at full-res
+  data instead of <track_dir>/inputs" mistake — raise/return a clear
+  error instead of silently running every gate on a mismatched
+  coordinate frame.
+- Lazy ViTPose ([src/vitpose_runner.py](src/vitpose_runner.py)):
+  ViTPose-Huge now runs on demand per (video, frame) and memoizes,
+  instead of an eager full-clip forward + DARK decode. It is the
+  cascade's last-resort backup (consulted only on frames where every MP
+  path fails), so MP-dominated clips drop from N ViT forwards to a
+  handful (e.g. rgb_01: 1 vs 384). The pose loop passes the
+  already-decoded frame so there is no re-read. Output verified
+  byte-identical to the eager path (0 source mismatches, max kpt diff
+  0.000000 px over 1,517 ViTPose frames).
+- ViTPose confidence floor (`VITPOSE_MIN_MEAN_SCORE = 0.05` in
+  [src/pose_video_v2.py](src/pose_video_v2.py)): ViTPose never abstains,
+  so a near-zero mean heatmap-peak score means no real hand — reject
+  rather than feed the gates. (Replaces the old run_video docstring that
+  claimed a floor the code never applied.)
+- Handedness tie-break + empty-handedness warning
+  ([src/label_tracking_handedness.py](src/label_tracking_handedness.py)):
+  when exactly two hands are tracked but only one gets a confident L/R
+  label, assign the other the opposite side (guarded on `seen_oids==2`
+  so genuine single-hand clips are untouched); and the pose stage warns
+  loudly if `--vitpose` is set with no handedness labels (backup would
+  be silently inert).
+- `cv2.VideoWriter.isOpened()` + positive-(W,H,fps) guards in all four
+  render stages (tracker, labeler, pose, smoother): a failed codec /
+  degenerate size silently dropped every frame while the stage reported
+  success.
+
+### Removed
+- Dead code in [src/pose_video_v2.py](src/pose_video_v2.py): `bbox_area`,
+  `kp_bbox`, `expand_to_square_crop`, `run_mp_image_crop`,
+  `RERUN_BBOX_EXPAND` (all unreferenced after the hull-area gate switch).
+- Legacy modules superseded since 0003 and referenced nowhere in the live
+  pipeline: `src/detect_hands_demo.py`, `src/detect_hands_pipeline.py`,
+  `src/pose_video_mp.py`.
+
+### Deferred (tracked for a later pass; need isolated evaluation)
+- Shared module + central config to de-dup ~50 thresholds and the
+  decode/hull/render primitives copy-pasted across stages.
+- One calibrated [0,1] per-keypoint confidence channel across detectors
+  (an algorithm change that would alter Kalman weighting).
+- Caching decoded masks/hulls in the render passes (perf; naive caching
+  risks a multi-GB RAM regression).
+
 ## [0015] - 2026-05-28
 
 ### Added

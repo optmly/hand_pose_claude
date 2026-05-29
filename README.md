@@ -46,7 +46,10 @@ Pipeline stages, in order:
       zeroing. Gives MP enough context for closed-fist / dorsal-view
       cases.
    5. **ViTPose-Huge wholebody** (`--vitpose`) for the matching L/R
-      side, gated against the same hull and mask checks.
+      side, gated against the same hull and mask checks, plus a mean
+      heatmap-peak floor (`VITPOSE_MIN_MEAN_SCORE`). Runs lazily — only
+      on frames that reach this stage (memoized per frame), never
+      eagerly over the whole clip — and requires a wearer L/R label.
    Every detector candidate must pass all hull/mask gates AND
    `gate_temporal_jump` (`base × √(1 + prev_age)`); first to pass
    wins. Carryforward (≤10 frames) snaps the held pose to the current
@@ -119,6 +122,10 @@ python src/label_tracking_handedness.py \
     --source-dir outputs/release_50_v3/track_v1/inputs
 
 # 3) Pose: full cascade with ViTPose backup.
+#    NOTE: --source-dir MUST be the tracker's <track_dir>/inputs (the
+#    downsampled videos), NOT the full-res dataset — the pose + smoother
+#    stages now fail fast if the source resolution doesn't match the
+#    tracker masks.
 python src/pose_video_v2.py \
     --track-dir outputs/release_50_v3/track_v1 \
     --source-dir outputs/release_50_v3/track_v1/inputs \

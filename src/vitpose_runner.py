@@ -106,11 +106,12 @@ def _udp_decode_full_frame(heatmaps: np.ndarray, W_img: int, H_img: int,
 # ──────────────────────── per-video pass ────────────────────────
 
 class ViTPoseRunner:
-    """Cached per-video ViTPose-Huge wholebody pass.
+    """Lazy per-video ViTPose-Huge wholebody backup.
 
-    Lazily loads the model on first use and runs the whole video once,
-    storing per-frame left/right hand keypoints + average scores. Frame-
-    level lookups (`get_left`, `get_right`) then return cached arrays.
+    Loads the model on first use. ViTPose is the pose cascade's last-resort
+    backup, consulted only on frames where every MediaPipe path fails, so
+    inference runs ON DEMAND per (video, frame) via `get_for_side` and is
+    memoized — never eagerly over the whole clip.
     """
 
     def __init__(self, ckpt: str | Path = DEFAULT_CKPT,
@@ -121,7 +122,9 @@ class ViTPoseRunner:
         self.dtype = dtype
         self.input_h, self.input_w = input_hw
         self._model = None
-        self._cache: dict[Path, dict] = {}     # video_path -> {'lm_L', 'lm_R', 'cs_L', 'cs_R'}
+        self._torch_dtype = torch.float16 if dtype == "float16" else torch.float32
+        # video_path -> {frame_idx -> {'lm_L','lm_R','sc_L','sc_R'}}, lazily filled
+        self._cache: dict[Path, dict] = {}
 
     def _load_model(self):
         if self._model is not None:
@@ -135,68 +138,65 @@ class ViTPoseRunner:
         self._model = model
         self._torch_dtype = torch_dtype
 
-    def run_video(self, video_path: Path, max_frames: int | None = None) -> dict:
-        """Run ViTPose over the full (or first `max_frames`) of `video_path`.
-
-        Returns a dict {'lm_L', 'lm_R', 'cs_L', 'cs_R'} where each is a
-        per-frame list. `lm_*[i]` is None when the kpt average score is below
-        a permissive floor (0.05); otherwise an (21, 2) float32 array.
-        """
-        if video_path in self._cache:
-            return self._cache[video_path]
+    def _infer_frame(self, rgb: np.ndarray) -> dict:
+        """Run a single ViT-Huge forward + UDP/DARK decode on one RGB frame.
+        Returns {'lm_L','lm_R','sc_L','sc_R'} ((21,2)/(21,) float32) in the
+        frame's own pixel coordinates."""
         self._load_model()
-        cap = cv2.VideoCapture(str(video_path))
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if max_frames is None:
-            max_frames = total
-        else:
-            max_frames = min(max_frames, total)
+        H_img, W_img = rgb.shape[:2]
+        img_in = cv2.resize(rgb, (self.input_w, self.input_h),
+                             interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+        img_in = ((img_in - _IMAGENET_MEAN) / _IMAGENET_STD).transpose(2, 0, 1)[None]
+        x = torch.from_numpy(img_in).to(self.device).to(self._torch_dtype)
+        with torch.inference_mode():
+            heatmaps = self._model(x)
+        kpts, scores = _udp_decode_full_frame(
+            heatmaps.float().cpu().numpy(), W_img=W_img, H_img=H_img, kernel=11,
+        )
+        return {
+            "lm_L": kpts[LEFT_HAND_IDX].astype(np.float32),
+            "lm_R": kpts[RIGHT_HAND_IDX].astype(np.float32),
+            "sc_L": scores[LEFT_HAND_IDX].astype(np.float32),
+            "sc_R": scores[RIGHT_HAND_IDX].astype(np.float32),
+        }
 
-        lm_L = [None] * max_frames
-        lm_R = [None] * max_frames
-        sc_L = [None] * max_frames   # per-kp (21,) heatmap-peak scores
-        sc_R = [None] * max_frames
+    def run_video(self, video_path: Path, max_frames: int | None = None) -> dict:
+        """LAZY registration (no eager inference). ViTPose is the cascade's
+        last-resort backup, consulted only on frames where every MP path
+        fails. Running it eagerly over the whole clip wastes a full-clip
+        ViT-Huge forward + DARK decode on frames never read. So this just
+        loads the model + inits the per-frame cache; actual inference happens
+        on demand in `get_for_side`."""
+        self._load_model()
+        self._cache.setdefault(video_path, {})
+        return self._cache[video_path]
 
-        for fi in range(max_frames):
-            ok, bgr = cap.read()
-            if not ok:
-                break
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            img_in = cv2.resize(rgb, (self.input_w, self.input_h),
-                                 interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-            img_in = ((img_in - _IMAGENET_MEAN) / _IMAGENET_STD).transpose(2, 0, 1)[None]
-            x = torch.from_numpy(img_in).to(self.device).to(self._torch_dtype)
-            with torch.inference_mode():
-                heatmaps = self._model(x)
-            kpts, scores = _udp_decode_full_frame(
-                heatmaps.float().cpu().numpy(), W_img=W, H_img=H, kernel=11,
-            )
-            lm_L[fi] = kpts[LEFT_HAND_IDX].astype(np.float32)
-            lm_R[fi] = kpts[RIGHT_HAND_IDX].astype(np.float32)
-            sc_L[fi] = scores[LEFT_HAND_IDX].astype(np.float32)
-            sc_R[fi] = scores[RIGHT_HAND_IDX].astype(np.float32)
-
-        cap.release()
-        result = {"lm_L": lm_L, "lm_R": lm_R, "sc_L": sc_L, "sc_R": sc_R}
-        self._cache[video_path] = result
-        return result
-
-    def get_for_side(self, video_path: Path, frame_idx: int, side: str
+    def get_for_side(self, video_path: Path, frame_idx: int, side: str,
+                      rgb: np.ndarray | None = None
                       ) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return (kpts_21x2, per_kp_scores_21) for the requested side at this
-        frame, or (None, None)."""
+        frame, or (None, None). Computes ViTPose lazily for `frame_idx` and
+        memoizes per (video, frame). If `rgb` (the already-decoded full frame
+        in video_path's coordinate frame) is given, it is used directly to
+        avoid re-reading the video; otherwise the frame is seeked + read."""
         if side not in ("left", "right"):
             return None, None
-        if video_path not in self._cache:
-            return None, None
-        d = self._cache[video_path]
-        if frame_idx < 0 or frame_idx >= len(d["lm_L"]):
-            return None, None
+        fc = self._cache.setdefault(video_path, {})
+        if frame_idx not in fc:
+            frame_rgb = rgb
+            if frame_rgb is None:
+                cap = cv2.VideoCapture(str(video_path))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+                ok, bgr = cap.read()
+                cap.release()
+                if not ok:
+                    return None, None
+                frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            fc[frame_idx] = self._infer_frame(frame_rgb)
+        d = fc[frame_idx]
         if side == "left":
-            return d["lm_L"][frame_idx], d["sc_L"][frame_idx]
-        return d["lm_R"][frame_idx], d["sc_R"][frame_idx]
+            return d["lm_L"], d["sc_L"]
+        return d["lm_R"], d["sc_R"]
 
     def unload(self):
         """Free model GPU memory between videos to keep the working set small."""

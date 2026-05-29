@@ -115,14 +115,17 @@ POSE_BBOX_MIN_RATIO = 0.30
 MP_VIDEO_MIN_AREA_RATIO = 0.45
 MP_VIDEO_IMAGE_MIN_AREA_RATIO = 0.45
 COMPRESSED_INTERP_MAX_LEN = 7
+# ViTPose-Huge never abstains — it emits a pose every frame. Reject its
+# candidate when the mean per-kp heatmap-peak score is below this floor
+# (no real hand found), rather than feeding a near-zero-confidence pose
+# into the gates.
+VITPOSE_MIN_MEAN_SCORE = 0.05
 # Temporal jump cap (fraction of image diagonal) for per-kp mean
 # displacement vs the most recently accepted pose for the same obj_id.
 CONSISTENCY_MAX_PX_FRAC = 0.10
 # How long a stretch of rejections may "carry forward" the previous pose
 # instead of leaving the frame empty.
 CONT_CARRYFWD_MAX_FRAMES = 10
-# IMAGE-mode rerun crop expansion (fraction of mask bbox, square) — legacy.
-RERUN_BBOX_EXPAND = 0.50
 # Mask-dilation expansion: kernel radius as a fraction of mask bbox diagonal.
 # 0.10 gives roughly +50% mask area for a typical hand mask. The dilated mask
 # becomes the crop (tight) AND the binary mask is used to zero out background
@@ -238,30 +241,6 @@ def mask_hull_area(hull) -> float:
     if hull is None:
         return 0.0
     return float(cv2.contourArea(hull.astype(np.int32)))
-
-
-def bbox_area(bbox) -> float:
-    x1, y1, x2, y2 = bbox
-    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
-
-
-def kp_bbox(pts: np.ndarray) -> tuple[float, float, float, float]:
-    return (float(pts[:, 0].min()), float(pts[:, 1].min()),
-            float(pts[:, 0].max()), float(pts[:, 1].max()))
-
-
-def expand_to_square_crop(bbox, image_w: int, image_h: int,
-                          expand_frac: float = RERUN_BBOX_EXPAND):
-    x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
-    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    side = max(x2 - x1, y2 - y1) * (1.0 + expand_frac)
-    half = side / 2.0
-    return (
-        max(0, int(round(cx - half))),
-        max(0, int(round(cy - half))),
-        min(image_w, int(round(cx + half))),
-        min(image_h, int(round(cy + half))),
-    )
 
 
 def mp_pts_to_image(landmarks, image_w: int, image_h: int) -> np.ndarray:
@@ -445,26 +424,6 @@ def run_mp_video_frame(landmarker, frame_rgb: np.ndarray, ts_ms: int,
         out.append({"keypoints": pts, "score": score, "handedness": handed,
                      "kp_confidences": kp_conf})
     return out
-
-
-def run_mp_image_crop(landmarker, frame_rgb: np.ndarray, crop) -> dict | None:
-    """Legacy bbox-only image rerun (kept for compatibility)."""
-    sx1, sy1, sx2, sy2 = crop
-    if sx2 <= sx1 or sy2 <= sy1:
-        return None
-    sub = np.ascontiguousarray(frame_rgb[sy1:sy2, sx1:sx2])
-    if sub.size == 0:
-        return None
-    img = mp.Image(image_format=mp.ImageFormat.SRGB, data=sub)
-    res = landmarker.detect(img)
-    if not res.hand_landmarks:
-        return None
-    pts = mp_pts_in_crop_to_image(res.hand_landmarks[0], crop)
-    score = float(res.handedness[0][0].score) if res.handedness else 0.0
-    handed = res.handedness[0][0].category_name if res.handedness else None
-    kp_conf = np.full(21, score, dtype=np.float32)
-    return {"keypoints": pts, "score": score, "handedness": handed,
-             "kp_confidences": kp_conf}
 
 
 def run_mp_image_masked(landmarker, frame_rgb: np.ndarray, mask: np.ndarray
@@ -751,6 +710,27 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
     image_diag = float(np.hypot(W, H))
 
     cap = cv2.VideoCapture(str(video_path))
+    # Fail fast on a source-resolution / frame-count mismatch. In dual-res
+    # mode the tracker writes masks + frames_meta["size"] at the DOWNSAMPLED
+    # resolution; the source video here must match. The common mistake is
+    # pointing --source-dir at the full-res dataset instead of
+    # track_v*/inputs, which would run every gate on a mismatched coordinate
+    # frame with no error. Catch it loudly.
+    vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if (vid_w, vid_h) != (int(W), int(H)):
+        cap.release()
+        raise ValueError(
+            f"{video_path.name}: source video is {vid_w}x{vid_h} but tracker "
+            f"masks are {W}x{H}. --source-dir likely points at full-res data "
+            f"instead of the tracker's <track_dir>/inputs. Use the persisted "
+            f"downsampled inputs, or re-track without --max-short-edge."
+        )
+    total_frames = len(frames_meta["frames"])
+    vid_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if max_frames is None and vid_frames > 0 and abs(vid_frames - total_frames) > 2:
+        print(f"  WARNING {video_path.name}: video has {vid_frames} frames but "
+              f"frames.json has {total_frames}; using min.", flush=True)
     total_frames = len(frames_meta["frames"])
     if max_frames is not None:
         total_frames = min(total_frames, max_frames)
@@ -764,6 +744,13 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
     # both MP VIDEO and MP IMAGE rerun have failed for an obj_id.
     vit_active = vitpose is not None
     if vit_active:
+        # ViTPose is only consulted for an obj whose wearer L/R label is
+        # known. If --vitpose is set but the labeler never ran (empty
+        # handedness map), the backup is silently inert — warn loudly.
+        if not handedness_by_oid:
+            print(f"  WARNING {stem}: --vitpose set but no wearer handedness "
+                  f"labels found (run label_tracking_handedness first); "
+                  f"ViTPose backup will be inert this video.", flush=True)
         vitpose.run_video(video_path, max_frames=total_frames)
 
     out_video = out_dir / f"{stem}_pose.mp4"
@@ -939,14 +926,24 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
             if best is None and vit_active:
                 side = handedness_by_oid.get(oid)
                 if side in ("left", "right"):
-                    v_kpts, v_kp_scores = vitpose.get_for_side(video_path, fidx, side)
+                    # Pass the already-decoded full frame so ViTPose computes
+                    # lazily on this frame without re-reading the video. `rgb`
+                    # is in video_path's coordinate frame (same as the masks).
+                    v_kpts, v_kp_scores = vitpose.get_for_side(video_path, fidx, side, rgb=rgb)
                     v_cand = None
                     if v_kpts is not None and v_kpts.shape == (21, 2):
                         v_mean = float(v_kp_scores.mean()) if v_kp_scores is not None else 0.0
                         entry["vitpose_mean_score"] = v_mean
-                        v_cand = {"keypoints": v_kpts, "score": v_mean,
-                                   "handedness": side.capitalize(),
-                                   "kp_confidences": v_kp_scores}
+                        # Confidence floor: ViTPose-Huge returns a pose for
+                        # every frame (it never abstains), so a near-zero mean
+                        # heatmap-peak score means it found no real hand. Drop
+                        # those instead of feeding garbage into the gates.
+                        if v_mean >= VITPOSE_MIN_MEAN_SCORE:
+                            v_cand = {"keypoints": v_kpts, "score": v_mean,
+                                       "handedness": side.capitalize(),
+                                       "kp_confidences": v_kp_scores}
+                        else:
+                            entry["vitpose_below_floor"] = True
                     best = _try(v_cand, "vitpose_huge", "vitpose_gate_diag",
                                  "vit_no_detection", "vit_gate_fail",
                                  "vit_temporal_jump")
@@ -993,7 +990,12 @@ def process_one_video(video_path: Path, track_dir: Path, out_dir: Path,
     interp_log = interpolate_short_compressed_runs(per_frame)
 
     # ── Re-render mp4 using final (post-processed) entries ─────────────
+    if not (W > 0 and H > 0 and fps > 0):
+        raise ValueError(f"{stem}: bad video params for writer W={W} H={H} fps={fps}")
     writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    if not writer.isOpened():
+        raise RuntimeError(f"{stem}: cv2.VideoWriter failed to open {out_video} "
+                           f"({W}x{H}@{fps}); check codec/disk.")
     cap = cv2.VideoCapture(str(video_path))
     for fidx in range(total_frames):
         ok, bgr = cap.read()

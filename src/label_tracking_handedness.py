@@ -173,6 +173,7 @@ def determine_handedness(
     needed = set(sample_idxs)
     score_sums: dict[int, dict[str, float]] = {}
     counts: dict[int, dict[str, int]] = {}
+    seen_oids: set[int] = set()   # obj_ids that appeared with a mask in any sampled frame
 
     use_dual = sam3_video_path is not None and sam3_video_path != video_path
     cap = cv2.VideoCapture(str(video_path))
@@ -200,6 +201,7 @@ def determine_handedness(
                 if h.get("bbox") is None or h.get("mask_rle") is None:
                     continue
                 obj_bboxes[int(h["obj_id"])] = h["bbox"]
+            seen_oids.update(obj_bboxes.keys())
             if obj_bboxes:
                 for prompt, label in ((SAM3_LEFT_PROMPT, "Left"), (SAM3_RIGHT_PROMPT, "Right")):
                     det = sam3_detect(sam3_proc, sam3_model, img, device, prompt)
@@ -245,6 +247,15 @@ def determine_handedness(
                 handedness[oid] = "left"
             elif d["Right"] > d["Left"]:
                 handedness[oid] = "right"
+    # Tie-break for the two-hand case where only ONE obj got a confident
+    # label: the wearer's two hands are anatomically opposite, so if exactly
+    # two objects were tracked but only one is labeled, give the other the
+    # opposite side. Guarded on seen_oids so a genuine single-hand clip
+    # (one tracked object) is left as-is.
+    if len(seen_oids) == 2 and len(handedness) == 1:
+        labeled_oid, labeled_side = next(iter(handedness.items()))
+        other = (seen_oids - {labeled_oid}).pop()
+        handedness[other] = "right" if labeled_side == "left" else "left"
     return handedness, score_sums, counts
 
 
@@ -259,7 +270,11 @@ def render_labeled_video(
     fps = frames_meta["fps"]
     cap = cv2.VideoCapture(str(video_path))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    if not (W > 0 and H > 0 and fps > 0):
+        raise ValueError(f"bad video params for writer W={W} H={H} fps={fps}")
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (W, H))
+    if not writer.isOpened():
+        raise RuntimeError(f"cv2.VideoWriter failed to open {out_path} ({W}x{H}@{fps})")
     fidx = 0
     while True:
         ok, bgr = cap.read()

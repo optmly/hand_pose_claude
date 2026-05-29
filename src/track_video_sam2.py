@@ -550,6 +550,13 @@ def redetect_lost_tracks(
 
     # Stage 2: SAM 2 add_new_mask + re-propagate (wrap in autocast)
     earliest_reseed = min(s[0] for s in new_seeds)
+    # Only the lost obj_ids were re-seeded; SAM 2 propagate_in_video still
+    # yields ALL tracked obj_ids each frame. Write back ONLY the lost
+    # object's re-propagated masks so the other (non-lost) object keeps its
+    # already-merged forward+backward masks. A full `masks_per_frame[fidx] =
+    # per_obj` (or even `.update(per_obj)`) would clobber the non-lost
+    # object with plain forward-only propagation, reverting backward fill.
+    lost_oids = {int(oid) for _, oid, _ in new_seeds}
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for f, oid, mask in new_seeds:
             sam2_video.add_new_mask(inference_state=state, frame_idx=f, obj_id=oid, mask=mask)
@@ -561,14 +568,17 @@ def redetect_lost_tracks(
         ):
             if fidx in reseed_frames:
                 continue
-            per_obj = {}
+            per_obj_lost = {}
             for oid, logit in zip(obj_ids, mask_logits):
+                if int(oid) not in lost_oids:
+                    continue
                 m = (logit > 0).cpu().numpy()
                 if m.ndim == 3:
                     m = m[0]
-                per_obj[int(oid)] = m.astype(bool)
-            masks_per_frame[int(fidx)] = per_obj
-            n_overridden += 1
+                per_obj_lost[int(oid)] = m.astype(bool)
+            if per_obj_lost:
+                masks_per_frame.setdefault(int(fidx), {}).update(per_obj_lost)
+                n_overridden += 1
     log["repropagated_frames"] = n_overridden
     return log
 
@@ -1746,7 +1756,12 @@ def track_one_video(
     # Write output video with overlays + per-frame RLE masks JSON.
     cap = cv2.VideoCapture(str(video_path))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    if not (width > 0 and height > 0 and fps > 0):
+        raise ValueError(f"bad video params for writer W={width} H={height} fps={fps}")
     writer = cv2.VideoWriter(str(out_video_path), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"cv2.VideoWriter failed to open {out_video_path} "
+                           f"({width}x{height}@{fps}); check codec/disk.")
     frame_records: list[dict] = []
     fidx = 0
     while True:
